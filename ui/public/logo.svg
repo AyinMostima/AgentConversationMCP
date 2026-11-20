@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AGORA - AgentConversationMCP">
+  <rect width="512" height="512" rx="114" fill="#131B2F"/>
+  <path transform="rotate(-35 256 256) translate(256 256) scale(0.84) translate(-256 -256)" fill="#ffffff" d="M241 89.64A170 170 0 1 0 241 422.36A170 170 0 0 1 241 89.64ZM271 89.64A170 170 0 1 1 271 422.36A170 170 0 0 0 271 89.64Z"/>
+  <path fill="#ffffff" d="M256 216l40 40-40 40-40-40z"/>
+</svg>

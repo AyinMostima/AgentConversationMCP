@@ -1,0 +1,14 @@
+{
+  "name": "agent-conversation-mcp",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "drogon",
+      "default-features": false
+    },
+    "sqlite3",
+    "nlohmann-json",
+    "catch2"
+  ],
+  "builtin-baseline": "9d764a2d1be71c010cc4fc246de6b3b1d1787ef0"
+}

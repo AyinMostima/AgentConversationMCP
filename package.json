@@ -1,0 +1,42 @@
+{
+  "name": "agent-conversation-mcp",
+  "version": "0.3.0",
+  "description": "AGORA (AgentConversationMCP): local multi-agent MCP conversation hub with a C++23 control core, client hooks, and a bilingual operator web console.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AyinMostima/AgentConversationMCP.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "multi-agent",
+    "ai-agents",
+    "claude",
+    "codex",
+    "windows"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "node src/mcp/server.mjs",
+    "stop": "node scripts/acm-admin.mjs stop",
+    "console": "node scripts/acm-admin.mjs console",
+    "shortcut": "node scripts/install-shortcut.mjs",
+    "install:clients": "node scripts/install-clients.mjs",
+    "admin": "node scripts/acm-admin.mjs",
+    "demo": "node scripts/demo.mjs",
+    "build:ui": "npm --prefix ui install --no-fund --no-audit && npm --prefix ui run build",
+    "test:mcp": "node --test --test-concurrency=1 test/mcp/transport.spec.mjs test/mcp/interconnect.spec.mjs test/mcp/cli.spec.mjs test/mcp/remote.spec.mjs test/mcp/hook.spec.mjs test/mcp/alerts.spec.mjs test/mcp/tidy.spec.mjs test/mcp/wake.spec.mjs test/mcp/startup.spec.mjs",
+    "test:stdio": "node --test test/mcp/stdio.spec.mjs",
+    "test:install": "node --test test/scripts/install-clients.spec.mjs",
+    "test:codex": "node --test test/adapters/codex.spec.mjs",
+    "test:ui": "node scripts/capture-screens.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,13 @@
+# Build output and dependency caches
+/build/
+/vcpkg_installed/
+node_modules/
+/dist/
+
+# Local runtime data and test output
+/.data/
+/test-output/
+/uploads/
+
+# Built operator console (npm run build:ui)
+/ui/dist/

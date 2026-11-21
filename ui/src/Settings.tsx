@@ -32,6 +32,51 @@ function LanguageSetting() {
   );
 }
 
+/** The operator's standing rules for every session: shown to each conversation once, and again when changed. */
+function SharedRules() {
+  const { api, data, run } = useConsole();
+  const { t } = useI18n();
+  const current = data.settings.shared_rules;
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState(current);
+  const [busy, track] = useBusy();
+  const lines = current.split('\n').filter((line) => line.trim() !== '').length;
+  return (
+    <section className="setting setting-stack">
+      <div className="setting-row">
+        <Icon name="check" size={18} />
+        <div>
+          <strong>{t.settings.rulesTitle}</strong>
+          <p>{current.trim() === '' ? t.settings.rulesNone : t.settings.rulesSome(lines, formatTime(data.settings.shared_rules_at, t.dateLocale))}</p>
+        </div>
+        <MoreButton
+          open={open}
+          onToggle={() => {
+            setText(current);
+            setOpen((value) => !value);
+          }}
+          label={t.settings.rulesEditAria}
+        />
+      </div>
+      {open && (
+        <form
+          className="hook-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void track(run(() => api.setSharedRules(text.trim()), t.settings.rulesSaved)).then((saved) => saved !== undefined && setOpen(false));
+          }}
+        >
+          <p className="muted small">{t.settings.rulesIntro}</p>
+          <textarea className="rules-text" rows={7} maxLength={6000} value={text} placeholder={t.settings.rulesPlaceholder} aria-label={t.settings.rulesTitle} onChange={(event) => setText(event.target.value)} />
+          <div className="row-actions">
+            <SubmitButton busy={busy} disabled={text.trim() === current.trim()}>{t.common.save}</SubmitButton>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
+
 /** Per-session rate limits and duplicate collapsing controls. */
 function FloodControl() {
   const { api, data, run } = useConsole();
@@ -220,7 +265,7 @@ function idleRoute(provider: string, hook: ClientHook, dispatchClients: string[]
     if (!hook.knows_conversation) return t.settings.idleCodexNoConv;
     return t.settings.idleCodexQueue;
   }
-  return t.settings.idleAntigravity;
+  return dispatchClients.includes('antigravity') ? t.settings.idleAntigravityCli : t.settings.idleAntigravity;
 }
 
 /** Diagnostic view of all active ingress/egress routes and hook states. */
@@ -238,17 +283,22 @@ function Routes() {
     const silent = keepsBridge && session.bridge_tools === null;
     const fewer = session.bridge_tools !== null && session.bridge_tools !== data.tool_count;
     const behind = keepsBridge && session.bridge_tools !== null && (session.bridge_contract ?? 1) !== data.tool_contract;
-    const stale = silent || fewer || behind;
+    // A relaying bridge always calls the current tools; its client only has to list them
+    // again, which it is told to do. Nothing for the operator to act on.
+    const catching = session.bridge_relay && !silent && (fewer || behind);
+    const stale = !catching && (silent || fewer || behind);
     routes.push({
       key: `${session.session_id}-in`,
       name: t.settings.routeAccess(who),
       tone: session.last_seen_at === null ? 'muted' : stale ? 'warn' : 'ok',
-      label: session.last_seen_at === null ? t.settings.stNever : stale ? t.settings.stRestart : t.settings.stOk,
+      label: session.last_seen_at === null ? t.settings.stNever : stale ? t.settings.stRestart : catching ? t.settings.stCatching : t.settings.stOk,
       attention: session.last_seen_at !== null && stale,
       detail:
         session.last_seen_at === null
           ? t.settings.detailNever
-          : fewer
+          : catching
+            ? t.settings.detailCatching
+            : fewer
             ? `${t.settings.detailFewerTools(session.bridge_tools!, data.tool_count)}${t.settings.restartHint}`
             : silent
               ? `${t.settings.detailOldBridge(formatTime(session.last_seen_at, t.dateLocale))}${t.settings.restartHint}`
@@ -433,6 +483,7 @@ export function SettingsView() {
         </header>
         <div className="settings-list">
           <LanguageSetting />
+          <SharedRules />
           <Routes />
           <FloodControl />
           <GrokBot />

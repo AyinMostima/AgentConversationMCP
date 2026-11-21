@@ -293,6 +293,9 @@ TEST_CASE("a bridge enrolls the credential it generated, without an operator ste
     const json current = identity.enroll(token, {{"client", "codex"}, {"bridge_tools", 22}, {"bridge_contract", 3}});
     REQUIRE(current.at("bridge_tools") == 22);
     REQUIRE(current.at("bridge_contract") == 3);
+    // A bridge that relays the service's own tool list says so, and stops saying so when replaced by one that does not.
+    REQUIRE(current.at("bridge_relay") == false);
+    REQUIRE(identity.enroll(token, {{"client", "codex"}, {"bridge_tools", 23}, {"bridge_contract", 3}, {"bridge_relay", true}}).at("bridge_relay") == true);
     REQUIRE(identity.enroll(token, {{"client", "codex"}, {"bridge_tools", 22}}).at("bridge_contract").is_null());
     REQUIRE(identity.list_sessions().size() == 1);
 

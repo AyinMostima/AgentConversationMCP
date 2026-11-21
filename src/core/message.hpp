@@ -14,6 +14,7 @@
 #include "database.hpp"
 #include "event_log.hpp"
 #include "identity.hpp"
+#include "window.hpp"
 
 #include <functional>
 
@@ -38,6 +39,10 @@ struct Draft {
     std::optional<std::string> idempotency_key;
     // Asks for the readers to be interrupted: see delivery.hpp.
     bool urgent = false;
+    // Which window of the author's session wrote it, when that is known, and the
+    // windows it is meant for. Without targets it is for every window of its readers.
+    std::optional<std::string> author_window_id;
+    std::vector<Window> to_windows;
 };
 
 class Messages {
@@ -48,7 +53,11 @@ public:
     // Agent: {conversation_id, body, kind?, recipient_session_ids?, reply_to_message_id?, idempotency_key}.
     // Without recipients the message is shared with every reading member. With
     // recipients only the sender and those sessions can ever see it.
-    json send(const Session& session, const json& args);
+    // `window` is the caller's window when known; `to_windows` the windows the
+    // message is meant for (see window.hpp), each of which must belong to a
+    // session that can read the message.
+    json send(const Session& session, const json& args, const Window* window = nullptr,
+              std::vector<Window> to_windows = {});
 
     // Agent: {conversation_id, after_seq?, limit?} -> messages visible to the caller
     // with seq > after_seq, plus next_cursor, has_more and last_seq.
@@ -69,16 +78,21 @@ public:
 
     // Agent: messages after the caller's own read cursor in one conversation,
     // excluding its own, and moves that cursor forward.
-    json unread(const Session& session, std::string_view conversation_id, std::int64_t limit);
+    // With a window, the cursor is that window's own: two windows of one session
+    // each catch up from where they themselves stopped, and each sees what the
+    // other wrote.
+    json unread(const Session& session, std::string_view conversation_id, std::int64_t limit,
+                const Window* window = nullptr);
 
     // Moves the caller's read cursor forward; it never moves back.
-    void advance_cursor(const Session& session, std::string_view conversation_id, std::int64_t sequence);
+    void advance_cursor(const Session& session, std::string_view conversation_id, std::int64_t sequence,
+                        const Window* window = nullptr);
 
     // How many messages addressed to the caller it has not acknowledged yet.
     std::int64_t pending_count(const Session& session);
 
     // Operator: {conversation_id, body, kind?, recipient_session_ids?, idempotency_key?}.
-    json send_as_operator(const json& args);
+    json send_as_operator(const json& args, std::vector<Window> to_windows = {});
 
     // Operator: every message with all recipient receipts; {after_seq?, limit?}.
     json read_all(std::string_view conversation_id, const json& args);

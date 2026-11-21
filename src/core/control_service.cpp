@@ -18,7 +18,9 @@ ControlService::ControlService(const std::filesystem::path& data_dir, Clock cloc
       board_(database_, events_, conversations_, clock),
       bots_(database_, events_, clock),
       wake_(database_, events_, clock),
-      delivery_(database_, events_, clock) {
+      delivery_(database_, events_, clock),
+      windows_(database_, events_, clock),
+      clock_(clock) {
     identity_.expire_stale_pairings();
     // Whatever tunnel a previous run had is gone with that run.
     store_text_setting(database_, "remote_state", "stopped");
@@ -33,11 +35,12 @@ const std::vector<std::string>& ControlService::agent_tools() {
         "get_inbox",        "acknowledge_message", "list_tasks",    "create_task",
         "update_task",      "propose_conversation", "report_progress", "publish_artifact",
         "get_artifact",     "direct_message",   "bot_request",      "bot_requests",
-        "bot_pull",         "bot_respond"};
+        "bot_pull",         "bot_respond",      "name_window"};
     return names;
 }
 
-json ControlService::call_tool(std::string_view token, std::string_view tool, const json& args) {
+json ControlService::call_tool(std::string_view token, std::string_view tool, const json& args,
+                               const json& context) {
     const std::lock_guard lock(mutex_);
     // Offered by the local command line only, so a client that is triggered from
     // outside can register that trigger by itself. Not listed with the tools.
@@ -63,17 +66,43 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
     if (open && session.status == "active") {
         conversations_.join_lobby(session);
     }
+    // Which conversation of its application the call comes from. A window that is
+    // only known from its tool calls is kept alive by them.
+    std::optional<Window> known;
+    if (session.status == "active") {
+        known = database_.transaction([&] {
+            auto found = windows_.resolve(session, optional_string(context, "client", 32),
+                                          optional_string(context, "client_session", 256), std::nullopt);
+            if (found) {
+                database_.execute("UPDATE windows SET seen_at = ?, event = 'tool' WHERE window_id = ? AND hooked = 0",
+                                  to_rfc3339(clock_()), found->window_id);
+            }
+            return found;
+        });
+    }
+    const Window* window = known ? &*known : nullptr;
+    const json window_view = window != nullptr ? json{{"window_id", window->window_id}, {"name", window->name}}
+                                               : json(nullptr);
     if (tool == "get_session") {
         json view = identity_.describe(session);
         const bool active = session.status == "active";
         view["interconnection"] = {{"open_mode", open}, {"linked", session.linked}};
         view["conversations"] = active ? conversations_.list_for_session(session) : json::array();
         // Who else can be addressed, and what became of conversations this session asked for.
-        view["project_sessions"] = active ? conversations_.roster(session) : json::array();
+        view["project_sessions"] = active ? roster(session, window) : json::array();
         view["proposals"] = active ? conversations_.proposals_of(session) : json::array();
+        // The conversation this call comes from, as others address it.
+        view["window"] = window_view;
         return view;
     }
     identity_.require_active(session);
+    if (tool == "name_window") {
+        if (window == nullptr) {
+            fail("WINDOW_UNKNOWN",
+                 "this client does not tell which of its conversations a call comes from, so there is no window to name");
+        }
+        return windows_.rename(session, *window, args);
+    }
     if (tool == "bot_request") {
         return bots_.request(session, args);
     }
@@ -89,11 +118,19 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
     if (tool == "direct_message") {
         // Opens the pair's private conversation when needed, then goes through
         // the one message write path like any other send.
-        const json conversation = conversations_.direct(session, require_string(args, "to_session_id", 96));
+        const auto peer = require_string(args, "to_session_id", 96);
+        std::vector<Window> targets = target_windows(session, args);
+        for (const auto& target : targets) {
+            if (target.session_id != peer) {
+                fail("INVALID_RECIPIENT", std::format("window {} does not belong to session {}", target.name, peer),
+                     {{"window", target.name}});
+            }
+        }
+        const json conversation = conversations_.direct(session, peer);
         json draft = args;
         draft.erase("to_session_id");
         draft["conversation_id"] = conversation.at("conversation_id");
-        return messages_.send(session, draft);
+        return messages_.send(session, draft, window, std::move(targets));
     }
     if (tool == "list_conversations") {
         return {{"conversations", conversations_.list_for_session(session)}};
@@ -102,13 +139,13 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
         return conversations_.get_for_session(session, require_string(args, "conversation_id", 96));
     }
     if (tool == "check_in") {
-        return check_in(session, args);
+        return check_in(session, args, window);
     }
     if (tool == "read_messages") {
         json page = messages_.read(session, args);
         // Reading by hand also counts as caught up, so check_in does not repeat it.
         messages_.advance_cursor(session, page.at("conversation_id").get<std::string>(),
-                                 page.at("next_cursor").get<std::int64_t>());
+                                 page.at("next_cursor").get<std::int64_t>(), window);
         return page;
     }
     if (tool == "forward_message") {
@@ -127,7 +164,7 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
         return conversations_.propose(session, args);
     }
     if (tool == "send_message") {
-        return messages_.send(session, args);
+        return messages_.send(session, args, window, target_windows(session, args));
     }
     if (tool == "get_inbox") {
         return messages_.inbox(session, args);
@@ -226,6 +263,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         if (args.contains("alerts_enabled") && !args.at("alerts_enabled").is_boolean()) {
             fail("INVALID_ARGUMENT", "alerts_enabled must be true or false");
         }
+        // The operator's standing rules for every session; empty removes them.
+        const auto shared_rules = optional_string(args, "shared_rules", 6000);
         MessageLimits limits = message_limits(database_);
         const MessageLimits before = limits;
         limits.per_minute = optional_integer(args, "message_rate_per_minute", limits.per_minute, 0, 100000);
@@ -244,6 +283,14 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             }
             if (args.contains("alerts_enabled")) {
                 store_text_setting(database_, "alerts_enabled", args.at("alerts_enabled").get<bool>() ? "1" : "0");
+            }
+            if (shared_rules && *shared_rules != text_setting(database_, "shared_rules").value_or("")) {
+                shared_rules->empty() ? erase_setting(database_, "shared_rules")
+                                      : store_text_setting(database_, "shared_rules", *shared_rules);
+                // The time of the change is the version: windows are told the rules again.
+                store_text_setting(database_, "shared_rules_at", to_rfc3339(clock_()));
+                // The event says that they changed, not what they say.
+                events_.append("settings.changed", {}, "shared_rules", {{"bytes", shared_rules->size()}});
             }
             if (limits.per_minute != before.per_minute || limits.per_hour != before.per_hour ||
                 limits.duplicate_window_seconds != before.duplicate_window_seconds ||
@@ -372,6 +419,12 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     if (operation == "wake_report") {
         return wake_.report(args);
     }
+    if (operation == "rename_window") {
+        return windows_.admin_rename(target_id, args);
+    }
+    if (operation == "import_windows") {
+        return windows_.import(args);
+    }
     if (operation == "delivery_claim") {
         return delivery_.claim(args);
     }
@@ -433,7 +486,12 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     if (operation == "send_message") {
         json with_target = args.is_object() ? args : json::object();
         with_target["conversation_id"] = target_id;
-        return messages_.send_as_operator(with_target);
+        // The operator may name windows like any sender; they are looked up in the conversation's project.
+        std::vector<Window> targets;
+        if (const auto handles = optional_string_list(with_target, "to_windows"); !handles.empty()) {
+            targets = windows_.lookup(conversations_.get(target_id).at("project_id").get<std::string>(), handles);
+        }
+        return messages_.send_as_operator(with_target, std::move(targets));
     }
     if (operation == "set_goal") {
         return conversations_.set_goal(target_id, args);
@@ -456,7 +514,21 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     fail("UNKNOWN_OPERATION", std::format("operator operation {} is not available", operation));
 }
 
-json ControlService::check_in(const Session& session, const json& args) {
+std::vector<Window> ControlService::target_windows(const Session& session, const json& args) {
+    const std::vector<std::string> handles = optional_string_list(args, "to_windows");
+    return handles.empty() ? std::vector<Window>() : windows_.lookup(session.project_id, handles);
+}
+
+json ControlService::roster(const Session& session, const Window* window) {
+    json sessions = conversations_.roster(session);
+    for (auto& entry : sessions) {
+        // The single conversations of that application, each addressable by its name.
+        entry["windows"] = windows_.of_session(entry.at("session_id").get<std::string>(), window);
+    }
+    return sessions;
+}
+
+json ControlService::check_in(const Session& session, const json& args, const Window* window) {
     const auto only = optional_string(args, "conversation_id", 96);
     const auto limit = optional_integer(args, "limit", 30, 1, 200);
     if (only) {
@@ -481,7 +553,7 @@ json ControlService::check_in(const Session& session, const json& args) {
         if (entry.at("can_read").get<bool>()) {
             item["goal"] = conversations_.get(id).at("goal");
             item["tasks"] = board_.tasks(id, false);
-            const json page = messages_.unread(session, id, limit);
+            const json page = messages_.unread(session, id, limit, window);
             item["new_messages"] = page.at("messages");
             item["has_more"] = page.at("has_more");
             item["next_cursor"] = page.at("next_cursor");
@@ -492,12 +564,20 @@ json ControlService::check_in(const Session& session, const json& args) {
     const json bot_news = bots_.news(session);
     return {{"session_id", session.session_id},
             {"label", session.label},
+            // The conversation this call comes from: its name is how others address it (to_windows).
+            {"window", window != nullptr ? json{{"window_id", window->window_id}, {"name", window->name}} : json(nullptr)},
+            // The operator's standing rules for every session (set at the console, by the
+            // person who runs these sessions; not a peer's message). Null when there are none.
+            {"shared_rules", text_setting(database_, "shared_rules")
+                                 ? json{{"text", *text_setting(database_, "shared_rules")},
+                                        {"updated_at", text_setting(database_, "shared_rules_at").value_or("")}}
+                                 : json(nullptr)},
             {"unacknowledged", messages_.pending_count(session)},
             {"bot_results", bot_news.at("results")},
             {"bot_requests_waiting_for_you", bot_news.at("waiting_for_you")},
             {"conversations", conversations},
             // Who can be reached with direct_message.
-            {"project_sessions", conversations_.roster(session)},
+            {"project_sessions", roster(session, window)},
             {"proposals", conversations_.proposals_of(session)}};
 }
 
@@ -540,6 +620,9 @@ json ControlService::settings_view() {
             {"urgent_per_hour", limits.urgent_per_hour},
             // Whether a route that stopped working is announced with a system notification.
             {"alerts_enabled", text_setting(database_, "alerts_enabled").value_or("1") == "1"},
+            // Standing rules the operator set for every session, and when they last changed.
+            {"shared_rules", text_setting(database_, "shared_rules").value_or("")},
+            {"shared_rules_at", text_setting(database_, "shared_rules_at").value_or("")},
             {"grok_bot_id", text_setting(database_, "grok_bot_id").value_or("")}};
 }
 

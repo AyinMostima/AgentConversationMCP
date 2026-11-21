@@ -10,12 +10,12 @@
 //     on, the session is usable at once.
 // An operator-issued credential in ACM_SESSION_TOKEN takes precedence; such a
 // caller never registers anything on its own.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HOST, createCoreClient } from './mcp-server.mjs';
+import { HOST, conversationOf, createCoreClient } from './mcp-server.mjs';
 import { resolveDataDir } from './paths.mjs';
 import { TOOLS, TOOL_CONTRACT } from './tools.mjs';
 
@@ -68,13 +68,59 @@ export function takeBridgeOptions(argv) {
 }
 
 /**
+ * Starts the service (server.mjs with `args`) in the background, writing to `logFile`.
+ *
+ * A client that started an MCP server ends everything that server started when
+ * it quits (Antigravity says so in its log: "Terminated N leftover processes of
+ * MCP server"). A service started as a child of the bridge would end with the
+ * client that happened to need it first, under every other client still using
+ * it. On Windows it is therefore started by launch.mjs, which is created
+ * through WMI: such a process is nobody's child and belongs to no client's job.
+ * It gets the caller's environment. When that is not possible the service is
+ * started as a detached child, as on other systems. ACM_LAUNCH=child forces
+ * the latter.
+ */
+function launchService(args, logFile) {
+  if (process.platform === 'win32' && process.env.ACM_LAUNCH !== 'child') {
+    const words = [process.execPath, join(here, 'launch.mjs'), logFile, ...args].map((word) => `"${word}"`).join(' ');
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      // The service gets the environment of this caller, minus what only this launch needs.
+      "$environment = [string[]](Get-ChildItem Env: | Where-Object { $_.Name -notlike 'ACM_LAUNCH_*' } | ForEach-Object { $_.Name + '=' + $_.Value })",
+      '$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; EnvironmentVariables = $environment }',
+      '$made = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $env:ACM_LAUNCH_COMMAND; CurrentDirectory = $env:ACM_LAUNCH_CWD; ProcessStartupInformation = $startup }',
+      'if ($made.ReturnValue -ne 0) { exit 1 }',
+    ].join('; ');
+    const made = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+      env: { ...process.env, ACM_LAUNCH_COMMAND: words, ACM_LAUNCH_CWD: resolve(here, '..', '..') },
+      windowsHide: true,
+      timeout: 20000,
+      stdio: 'ignore',
+    });
+    if (made.status === 0) {
+      return;
+    }
+  }
+  const log = openSync(logFile, 'a');
+  const child = spawn(process.execPath, [join(here, 'server.mjs'), ...args], { detached: true, stdio: ['ignore', log, log], windowsHide: true });
+  child.unref();
+}
+
+/**
  * `say` receives one-line diagnostics; it must not write to stdout when stdout
  * carries a protocol or a result.
  */
 export function createBridge(options, say) {
-  const { autostart, dataDir, client, mcpPort, corePort, label, project, identityFile } = options;
+  const { autostart, dataDir, client, mcpPort, corePort, label, project, identityFile, relays = false } = options;
   const coreUrl = `http://${HOST}:${corePort}`;
+  const mcpUrl = `http://${HOST}:${mcpPort}/mcp`;
   const callCore = createCoreClient(coreUrl);
+  // Claude starts one bridge per conversation and names the conversation in its
+  // environment. Only Claude's own bridge takes that for its conversation: any
+  // other entry point started from inside a Claude conversation inherits the variable.
+  const ownConversation = process.env.ACM_CLIENT_SESSION ?? (client === 'claude' ? process.env.CLAUDE_CODE_SESSION_ID : undefined);
+  // What the client was last given: how many tools, of which contract version.
+  let reported = { tools: TOOLS.length, contract: TOOL_CONTRACT };
 
   /**
    * The credential this application generated for itself, kept across restarts
@@ -115,18 +161,30 @@ export function createBridge(options, say) {
   const token = selfIssued ? ownCredential() : issued;
   let enrolled = !selfIssued;
 
-  async function healthy() {
+  async function answers(url) {
     try {
-      return (await fetch(`${coreUrl}/healthz`)).ok;
+      return (await fetch(`${url}/healthz`)).ok;
     } catch {
       return false;
     }
   }
+  const coreUp = () => answers(coreUrl);
+  // A relay talks to the gateway, which says it is ready a moment after its control service does.
+  const healthy = async () => (await coreUp()) && (!relays || (await answers(`http://${HOST}:${mcpPort}`)));
 
   /** Start the service detached from this caller, logging to <data>/logs/service.log. */
   async function ensureService() {
     if (await healthy()) {
       return;
+    }
+    if (await coreUp()) {
+      // The service is starting: its gateway follows. Nothing to start, only to wait for.
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 200));
+        if (await healthy()) {
+          return;
+        }
+      }
     }
     if (!autostart) {
       say(`the service is not running on ${coreUrl}; start it with "npm start"`);
@@ -134,13 +192,7 @@ export function createBridge(options, say) {
     }
     const logDir = join(dataDir, 'logs');
     mkdirSync(logDir, { recursive: true });
-    const log = openSync(join(logDir, 'service.log'), 'a');
-    const child = spawn(process.execPath, [join(here, 'server.mjs'), '--data-dir', dataDir, '--mcp-port', mcpPort, '--core-port', corePort], {
-      detached: true,
-      stdio: ['ignore', log, log],
-      windowsHide: true,
-    });
-    child.unref();
+    launchService(['--data-dir', dataDir, '--mcp-port', mcpPort, '--core-port', corePort], join(logDir, 'service.log'));
     for (let attempt = 0; attempt < 100; attempt += 1) {
       if (await healthy()) {
         say(`started the service in the background (log: ${join(logDir, 'service.log')})`);
@@ -158,8 +210,10 @@ export function createBridge(options, say) {
       response = await fetch(`${coreUrl}/internal/v1/enroll`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-        // bridge_tools and bridge_contract let the console tell a client that still runs an older bridge from a current one.
-        body: JSON.stringify({ client, label, project_id: project, cwd: process.cwd(), run_id: `pid-${process.pid}`, bridge_tools: TOOLS.length, bridge_contract: TOOL_CONTRACT }),
+        // bridge_tools and bridge_contract tell the console which tools this client has
+        // been given; bridge_relay, that the bridge takes them from the service and so
+        // follows it without being restarted.
+        body: JSON.stringify({ client, label, project_id: project, cwd: process.cwd(), run_id: `pid-${process.pid}`, bridge_tools: reported.tools, bridge_contract: reported.contract, bridge_relay: relays }),
       });
     } catch (error) {
       return { status: 503, ok: false, error: { code: 'CORE_UNAVAILABLE', message: `the conversation service is not reachable at ${coreUrl}; start it with "npm start" (${error.message})`, details: {} } };
@@ -184,7 +238,8 @@ export function createBridge(options, say) {
   }
 
   /** One agent command; resolves to a control-service envelope. */
-  async function invoke(tool, args) {
+  async function invoke(tool, args, meta) {
+    const origin = { client, clientSession: conversationOf(meta, ownConversation) };
     if (!enrolled) {
       // Registration did not succeed at startup (service down, or revoked): try
       // again now, and report why when it still does not work.
@@ -194,21 +249,100 @@ export function createBridge(options, say) {
         return outcome;
       }
     }
-    let answer = await callCore(token, tool, args);
+    let answer = await callCore(token, tool, args, origin);
     if (!answer.ok && answer.error.code === 'CORE_UNAVAILABLE' && autostart) {
       // The service stopped since this caller started; whoever needs it next starts it.
       await ensureService();
-      answer = await callCore(token, tool, args);
+      answer = await callCore(token, tool, args, origin);
     }
     if (!answer.ok && answer.error.code === 'UNAUTHENTICATED' && selfIssued) {
       // The store was replaced since this identity was registered: register it again, once.
       const outcome = await enroll();
       if (outcome.ok) {
-        answer = await callCore(token, tool, args);
+        answer = await callCore(token, tool, args, origin);
       }
     }
     return answer;
   }
 
-  return { client, coreUrl, start, invoke };
+  let requestId = 0;
+
+  /** One MCP request to the service's own endpoint. */
+  async function post(method, params) {
+    const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${token}`, 'x-acm-client': client };
+    if (typeof ownConversation === 'string' && ownConversation !== '') {
+      headers['x-acm-client-session'] = ownConversation.slice(0, 250);
+    }
+    let response;
+    try {
+      requestId += 1;
+      response = await fetch(mcpUrl, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params }) });
+    } catch (error) {
+      return { down: error.cause?.code ?? error.message };
+    }
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+    return { status: response.status, contract: Number(response.headers.get('x-acm-contract')) || undefined, body };
+  }
+
+  /**
+   * Has the running service answer one MCP request (tools/list, tools/call,
+   * initialize) and resolves to {result, contract}, to {refused: {code, message}}
+   * when the service does not accept this session (a control-service error), to
+   * {error: {code, message}} for a protocol error, or to {unavailable: text}
+   * when it cannot be reached. The bridge holds no tool definitions of its own on this path: what
+   * the service offers now is what the client gets.
+   */
+  async function relay(method, params) {
+    if (!enrolled) {
+      await ensureService();
+      const outcome = await enroll();
+      if (!outcome.ok) {
+        return { unavailable: `${outcome.error.code}: ${outcome.error.message}` };
+      }
+    }
+    let answer = await post(method, params);
+    if ((answer.down !== undefined || answer.status === 503) && autostart) {
+      // The service stopped or is still starting; whoever needs it next starts it.
+      await ensureService();
+      answer = await post(method, params);
+    }
+    if (answer.status === 401 && selfIssued) {
+      // The store was replaced since this identity was registered: register it again, once.
+      const outcome = await enroll();
+      if (outcome.ok) {
+        answer = await post(method, params);
+      }
+    }
+    if (answer.down !== undefined) {
+      return { unavailable: `the conversation service is not reachable at ${mcpUrl}; start it with "npm start" (${answer.down})` };
+    }
+    if (answer.body?.result !== undefined) {
+      return { result: answer.body.result, contract: answer.contract };
+    }
+    if (answer.status === 503) {
+      return { unavailable: answer.body?.error?.message ?? 'the conversation service is starting' };
+    }
+    if (answer.status === 401) {
+      // Turned away at the door, as "CODE: message".
+      const [, code, message] = /^([A-Z_]+): (.*)$/s.exec(answer.body?.error?.message ?? '') ?? [];
+      return { refused: { code: code ?? 'UNAUTHENTICATED', message: message ?? 'the session credential is not accepted', details: {} } };
+    }
+    return { error: answer.body?.error ?? { code: -32603, message: `the service answered HTTP ${answer.status}` } };
+  }
+
+  /** Tells the service which tools the client now has, when that changed. */
+  async function served(tools, contract) {
+    if (!selfIssued || contract === undefined || (reported.tools === tools && reported.contract === contract)) {
+      return;
+    }
+    reported = { tools, contract };
+    await enroll();
+  }
+
+  return { client, coreUrl, start, invoke, relay, served };
 }

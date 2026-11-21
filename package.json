@@ -29,7 +29,7 @@
     "admin": "node scripts/acm-admin.mjs",
     "demo": "node scripts/demo.mjs",
     "build:ui": "npm --prefix ui install --no-fund --no-audit && npm --prefix ui run build",
-    "test:mcp": "node --test --test-concurrency=1 test/mcp/transport.spec.mjs test/mcp/interconnect.spec.mjs test/mcp/cli.spec.mjs test/mcp/remote.spec.mjs test/mcp/hook.spec.mjs test/mcp/alerts.spec.mjs test/mcp/tidy.spec.mjs test/mcp/wake.spec.mjs test/mcp/startup.spec.mjs",
+    "test:mcp": "node --test --test-concurrency=1 test/mcp/transport.spec.mjs test/mcp/interconnect.spec.mjs test/mcp/cli.spec.mjs test/mcp/remote.spec.mjs test/mcp/hook.spec.mjs test/mcp/alerts.spec.mjs test/mcp/tidy.spec.mjs test/mcp/wake.spec.mjs test/mcp/startup.spec.mjs test/mcp/window.spec.mjs test/mcp/dispatch.spec.mjs test/mcp/discover.spec.mjs",
     "test:stdio": "node --test test/mcp/stdio.spec.mjs",
     "test:install": "node --test test/scripts/install-clients.spec.mjs",
     "test:codex": "node --test test/adapters/codex.spec.mjs",

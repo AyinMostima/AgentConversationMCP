@@ -342,6 +342,132 @@ constexpr const char* kMigrations[] = {
     UPDATE agent_sessions SET self_enrolled = 1 WHERE session_id IN (
         SELECT entity_id FROM events WHERE event_type = 'pairing.created' AND payload LIKE '%"self_enrolled":true%');
     )sql",
+    // 015 - windows: the single conversations of a client application. What the
+    // hooks remember moves from one row per session to one row per window, a
+    // message records which window wrote it and which windows it is meant for,
+    // and each window keeps its own read cursor.
+    R"sql(
+    CREATE TABLE windows (
+        window_id       TEXT PRIMARY KEY,
+        session_id      TEXT NOT NULL REFERENCES agent_sessions(session_id),
+        client          TEXT NOT NULL DEFAULT '',
+        client_session  TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        cwd             TEXT,
+        event           TEXT NOT NULL,
+        seen_at         TEXT NOT NULL,
+        runs            INTEGER NOT NULL DEFAULT 0,
+        hooked          INTEGER NOT NULL DEFAULT 0,
+        shown_rowid     INTEGER NOT NULL DEFAULT 0,
+        urgent_rowid    INTEGER NOT NULL DEFAULT 0,
+        watch_seen_at   TEXT,
+        watch_id        TEXT,
+        addressable     INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL,
+        UNIQUE (session_id, client_session)
+    );
+    CREATE INDEX windows_by_session ON windows (session_id, seen_at);
+    CREATE TABLE window_cursors (
+        window_id        TEXT NOT NULL REFERENCES windows(window_id),
+        conversation_id  TEXT NOT NULL REFERENCES conversations(conversation_id),
+        read_seq         INTEGER NOT NULL,
+        PRIMARY KEY (window_id, conversation_id)
+    );
+    CREATE TABLE message_windows (
+        message_id  TEXT NOT NULL REFERENCES messages(message_id),
+        window_id   TEXT NOT NULL REFERENCES windows(window_id),
+        PRIMARY KEY (message_id, window_id)
+    );
+    ALTER TABLE messages ADD COLUMN author_window_id TEXT;
+    ALTER TABLE deliveries ADD COLUMN window_id TEXT;
+    INSERT INTO windows (window_id, session_id, client, client_session, name, cwd, event, seen_at, runs, hooked,
+                         shown_rowid, urgent_rowid, watch_seen_at, watch_id, created_at)
+        SELECT 'win_' || lower(hex(randomblob(16))), session_id, client, client_session,
+               CASE WHEN client = '' THEN 'window' ELSE client END || '-' || lower(hex(randomblob(2))), cwd, event, seen_at,
+               runs, 1, shown_rowid, urgent_rowid, watch_seen_at, watch_session, seen_at
+        FROM client_hooks WHERE client_session IS NOT NULL;
+    INSERT INTO window_cursors (window_id, conversation_id, read_seq)
+        SELECT w.window_id, cm.conversation_id, cm.read_seq FROM windows w
+        JOIN conversation_members cm ON cm.session_id = w.session_id WHERE cm.removed_at IS NULL;
+    )sql",
+    // 016 - a bridge that takes the tool list from the running service instead of
+    // carrying its own copy: such a bridge never has to be restarted for new tools.
+    R"sql(
+    ALTER TABLE agent_sessions ADD COLUMN bridge_relay INTEGER NOT NULL DEFAULT 0;
+    )sql",
+    // 017 - a start that found no conversation to continue is "skipped", not
+    // "failed": the route works, the conversation was simply not there any more
+    // (a helper thread its client never stored, or one that was deleted). The
+    // check on the column cannot be changed in place, so the table is rebuilt.
+    R"sql(
+    CREATE TABLE deliveries_next (
+        delivery_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id   TEXT NOT NULL REFERENCES agent_sessions(session_id),
+        created_at   TEXT NOT NULL,
+        route        TEXT NOT NULL CHECK (route IN ('start', 'prompt', 'stop', 'watch', 'command')),
+        status       TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed', 'skipped')),
+        upto_rowid   INTEGER NOT NULL,
+        messages     INTEGER NOT NULL,
+        urgent       INTEGER NOT NULL,
+        detail       TEXT,
+        window_id    TEXT
+    );
+    INSERT INTO deliveries_next (delivery_id, session_id, created_at, route, status, upto_rowid, messages, urgent, detail, window_id)
+        SELECT delivery_id, session_id, created_at, route,
+               CASE WHEN status = 'failed' AND (detail LIKE '%no rollout found%' OR detail LIKE '%thread not found%'
+                                                OR detail LIKE '%unknown thread%' OR detail LIKE '%session not found%')
+                    THEN 'skipped' ELSE status END,
+               upto_rowid, messages, urgent, detail, window_id
+        FROM deliveries;
+    DROP TABLE deliveries;
+    ALTER TABLE deliveries_next RENAME TO deliveries;
+    CREATE INDEX deliveries_by_session ON deliveries (session_id, created_at);
+    )sql",
+    // 018 - where a delivery started: together with upto_rowid it says which
+    // messages a route put in front of a window, so that an urgent message that
+    // woke a window is not listed for it a second time by the next prompt.
+    R"sql(
+    ALTER TABLE deliveries ADD COLUMN from_rowid INTEGER;
+    CREATE INDEX deliveries_by_window ON deliveries (window_id, route);
+    )sql",
+    // 019 - a command that only hands a message to a running application (it does
+    // not run the turn itself) proves nothing about a turn having started: such a
+    // delivery waits for a sign of life from the window, and is tried another way
+    // when none comes.
+    R"sql(
+    ALTER TABLE deliveries ADD COLUMN unconfirmed INTEGER;
+    )sql",
+    // 020 - a window that was taken from its client's own record of conversations
+    // and has not been heard of by itself yet. It can be addressed and woken by
+    // name; it is not woken by a message to everybody.
+    R"sql(
+    ALTER TABLE windows ADD COLUMN imported INTEGER NOT NULL DEFAULT 0;
+    )sql",
+    // 021 - handing a message to a client can take more than one step (put it in
+    // the conversation's queue, then have the application open the conversation):
+    // which step a delivery was. deliveries.unconfirmed now holds how many seconds
+    // a sign of life may take, instead of a flag.
+    R"sql(
+    ALTER TABLE deliveries ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+    UPDATE deliveries SET unconfirmed = 90 WHERE unconfirmed = 1;
+    )sql",
+    // 022 - which version of the operator's shared rules a window was last shown,
+    // so that each window is told them once, and again when they change.
+    R"sql(
+    ALTER TABLE windows ADD COLUMN rules_seen TEXT;
+    )sql",
+    // 023 - the title a client itself shows for a conversation, beside the name the
+    // window is addressed by: with it another session can tell what a window is for.
+    R"sql(
+    ALTER TABLE windows ADD COLUMN title TEXT;
+    )sql",
+    // 024 - a delivery that went to a stand-in says so, instead of forgetting where
+    // it started: when the stand-in's turn fails later, the window can be started
+    // again for the same messages.
+    R"sql(
+    ALTER TABLE deliveries ADD COLUMN stand_in INTEGER NOT NULL DEFAULT 0;
+    UPDATE deliveries SET stand_in = 1 WHERE route = 'command' AND from_rowid IS NULL AND detail LIKE '%stand-in%';
+    )sql",
 };
 
 }  // namespace

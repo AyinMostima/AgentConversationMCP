@@ -8,12 +8,14 @@ import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { callTool, connectClient, freePort, repoRoot, startService } from '../support/service.mjs';
 
 const bridge = join(repoRoot, 'src', 'mcp', 'stdio.mjs');
@@ -88,7 +90,7 @@ describe('MCP stdio bridge', { concurrency: false }, () => {
   it('exposes the same tools and reaches the same store as an HTTP client', async () => {
     const stdio = await connectStdio(['--no-autostart'], { ACM_SESSION_TOKEN: tokens.stdio });
     const names = (await stdio.listTools()).tools.map((tool) => tool.name).sort();
-    assert.equal(names.length, 22);
+    assert.equal(names.length, 23);
     assert.ok(names.includes('check_in') && names.includes('update_task') && names.includes('direct_message'));
     assert.ok(names.includes('send_message') && names.includes('get_inbox'));
     assert.equal(stdio.getServerVersion().name, 'agent-conversation-mcp');
@@ -207,3 +209,176 @@ describe('MCP stdio bridge', { concurrency: false }, () => {
     }
   });
 });
+
+// A desktop client ends everything its MCP server started when it quits. The
+// service, which the other clients go on using, must not be among that.
+describe('a service started by a bridge', { concurrency: false }, () => {
+  const ownBase = mkdtempSync(join(tmpdir(), `acm-apart-${runId}-`));
+  const ownData = join(ownBase, 'data');
+  let ownPorts;
+
+  after(async () => {
+    try {
+      const adminToken = readFileSync(join(ownData, 'admin-token.txt'), 'utf8').trim();
+      await fetch(`http://127.0.0.1:${ownPorts.mcpPort}/shutdown`, { method: 'POST', headers: { 'x-acm-admin-token': adminToken, connection: 'close' } });
+      await new Promise((done) => setTimeout(done, 1500));
+    } catch {
+      // It was not running any more.
+    }
+    await rm(ownBase, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  it('outlives the client that started it', { skip: process.platform !== 'win32' }, async () => {
+    ownPorts = { mcpPort: await freePort(), corePort: await freePort() };
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [bridge, '--client', 'grok', '--data-dir', ownData, '--mcp-port', String(ownPorts.mcpPort), '--core-port', String(ownPorts.corePort)],
+      env: { ...process.env, ACM_ALERTS: 'off' },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'quitting-client', version: '0.0.1' });
+    await client.connect(transport);
+    try {
+      assert.equal((await callTool(client, 'get_session')).result.status, 'active');
+      // The client quits the way Antigravity does: its MCP server and all that descends from it are ended.
+      await promisify(execFile)('taskkill', ['/PID', String(transport.pid), '/T', '/F']);
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+    await new Promise((done) => setTimeout(done, 1500));
+    assert.ok((await fetch(`http://127.0.0.1:${ownPorts.corePort}/healthz`)).ok, 'the service is still running');
+    assert.ok((await fetch(`http://127.0.0.1:${ownPorts.mcpPort}/healthz`)).ok, 'and so is its gateway');
+  });
+
+  it('can be restarted from the console afterwards', { skip: process.platform !== 'win32' }, async () => {
+    const adminToken = readFileSync(join(ownData, 'admin-token.txt'), 'utf8').trim();
+    const accepted = await fetch(`http://127.0.0.1:${ownPorts.mcpPort}/restart`, { method: 'POST', headers: { 'x-acm-admin-token': adminToken, connection: 'close' } });
+    assert.equal(accepted.status, 200);
+    // The replacement writes to the same log; it must be able to open it.
+    const log = () => readFileSync(join(ownData, 'logs', 'service.log'), 'utf8');
+    await waitUntil(() => (log().match(/acm-mcp \S+ listening/g) ?? []).length === 2, 'the replacement to listen', 300);
+    assert.ok(!log().includes('[ERROR]'), log());
+    assert.ok((await fetch(`http://127.0.0.1:${ownPorts.mcpPort}/healthz`)).ok);
+  });
+});
+
+// The bridge carries no tool list of its own to the client: what the running
+// service offers is what the client gets, also after the service changed. A
+// stand-in service makes that change on demand.
+describe('MCP stdio bridge as a relay', { concurrency: false }, () => {
+  const relayBase = mkdtempSync(join(tmpdir(), `acm-relay-${runId}-`));
+  const state = { contract: 7, tools: ['alpha'], enrolled: [], calls: [] };
+  const servers = [];
+  let relayPorts;
+  let client;
+
+  const tool = (name) => ({ name, description: `stand-in ${name}`, inputSchema: { type: 'object', properties: { text: { type: 'string' } } } });
+  const listen = (handler) =>
+    new Promise((done) => {
+      const server = createServer(handler);
+      servers.push(server);
+      server.listen(0, '127.0.0.1', () => done(server.address().port));
+    });
+  const bodyOf = async (request) => {
+    const chunks = [];
+    for await (const chunk of request) {
+      chunks.push(chunk);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  };
+  const answer = (response, body, headers = {}) => {
+    response.writeHead(200, { 'content-type': 'application/json', connection: 'close', ...headers });
+    response.end(JSON.stringify(body));
+  };
+
+  before(async () => {
+    relayPorts = {
+      corePort: await listen(async (request, response) => {
+        if (request.url === '/internal/v1/enroll') {
+          state.enrolled.push(await bodyOf(request));
+          answer(response, { ok: true, result: { session_id: 'ses_standin', status: 'active' } });
+        } else {
+          answer(response, { ok: true, result: { status: 'ok' } });
+        }
+      }),
+      mcpPort: await listen(async (request, response) => {
+        if (request.url === '/healthz') {
+          answer(response, { ok: true, result: { status: 'ok' } });
+          return;
+        }
+        const message = await bodyOf(request);
+        const reply = (result) => answer(response, { jsonrpc: '2.0', id: message.id, result }, { 'x-acm-contract': String(state.contract) });
+        if (message.method === 'initialize') {
+          reply({ protocolVersion: message.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'stand-in', version: '0' }, instructions: 'said by the running service' });
+        } else if (message.method === 'tools/list') {
+          reply({ tools: state.tools.map(tool) });
+        } else {
+          state.calls.push({ params: message.params, client: request.headers['x-acm-client'], conversation: request.headers['x-acm-client-session'] });
+          reply({ content: [{ type: 'text', text: `${message.params.name} ran` }] });
+        }
+      }),
+    };
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [bridge, '--no-autostart', '--client', 'codex', '--data-dir', join(relayBase, 'data'), '--mcp-port', String(relayPorts.mcpPort), '--core-port', String(relayPorts.corePort)],
+      env: { SystemRoot: process.env.SystemRoot ?? '', PATH: process.env.PATH ?? '', ACM_CLIENT_SESSION: 'conv-from-env' },
+      stderr: 'pipe',
+    });
+    client = new Client({ name: 'relay-stand-in', version: '0.0.1' });
+    await client.connect(transport);
+  });
+
+  after(async () => {
+    await client?.close().catch(() => undefined);
+    for (const server of servers) {
+      server.closeAllConnections();
+      server.close();
+    }
+    await rm(relayBase, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  it('gives the client the tools and the instructions of the running service', async () => {
+    assert.equal(client.getInstructions(), 'said by the running service');
+    assert.deepEqual((await client.listTools()).tools.map((entry) => entry.name), ['alpha']);
+    // It says that it relays, and which tools its client has been given.
+    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 7, 'the served tools to be reported');
+    assert.deepEqual(
+      (({ bridge_relay, bridge_tools, bridge_contract }) => ({ bridge_relay, bridge_tools, bridge_contract }))(state.enrolled.at(-1)),
+      { bridge_relay: true, bridge_tools: 1, bridge_contract: 7 },
+    );
+  });
+
+  it('passes a call on untouched, with what the client said about its conversation', async () => {
+    const result = await client.callTool({ name: 'alpha', arguments: { text: 'hi' }, _meta: { threadId: 'thread-7' } });
+    assert.equal(result.content[0].text, 'alpha ran');
+    const call = state.calls.at(-1);
+    assert.deepEqual(call.params.arguments, { text: 'hi' });
+    assert.equal(call.params._meta.threadId, 'thread-7');
+    assert.equal(call.client, 'codex');
+    assert.equal(call.conversation, 'conv-from-env');
+  });
+
+  it('follows a service that gained a tool, without being restarted', async () => {
+    const told = new Promise((done) => client.setNotificationHandler(ToolListChangedNotificationSchema, () => done(true)));
+    state.contract = 8;
+    state.tools = ['alpha', 'beta'];
+    // The next call notices; the client is told to ask for the list again.
+    await client.callTool({ name: 'alpha', arguments: {} });
+    assert.equal(await Promise.race([told, new Promise((done) => setTimeout(() => done(false), 5000))]), true, 'the client must be told that the tools changed');
+    assert.deepEqual((await client.listTools()).tools.map((entry) => entry.name), ['alpha', 'beta']);
+    // A tool that did not exist when the bridge started can be called through it.
+    assert.equal((await client.callTool({ name: 'beta', arguments: {} })).content[0].text, 'beta ran');
+    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 8, 'the new tools to be reported');
+    assert.equal(state.enrolled.at(-1).bridge_tools, 2);
+  });
+});
+
+async function waitUntil(check, what, attempts = 100) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (check()) {
+      return;
+    }
+    await new Promise((done) => setTimeout(done, 50));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}

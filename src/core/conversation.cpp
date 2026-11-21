@@ -282,6 +282,7 @@ std::int64_t Conversations::delete_messages(std::string_view conversation_id, co
     run("DELETE FROM progress_events WHERE message_id IN (" + chosen + ")");
     run("DELETE FROM artifact_refs WHERE message_id IN (" + chosen + ")");
     run("DELETE FROM message_recipients WHERE message_id IN (" + chosen + ")");
+    run("DELETE FROM message_windows WHERE message_id IN (" + chosen + ")");
     // What stays may point at what goes: a later reply, or a copy forwarded into another conversation.
     run("UPDATE messages SET reply_to_message_id = NULL WHERE reply_to_message_id IN (" + chosen + ")");
     run("UPDATE messages SET forwarded_from = NULL WHERE forwarded_from IN (" + chosen + ")");
@@ -291,6 +292,9 @@ std::int64_t Conversations::delete_messages(std::string_view conversation_id, co
         // remember a position beyond the last message that still exists.
         database_.execute(
             "UPDATE client_hooks SET shown_rowid = MIN(shown_rowid, (SELECT COALESCE(MAX(rowid), 0) FROM messages)), "
+            "urgent_rowid = MIN(urgent_rowid, (SELECT COALESCE(MAX(rowid), 0) FROM messages))");
+        database_.execute(
+            "UPDATE windows SET shown_rowid = MIN(shown_rowid, (SELECT COALESCE(MAX(rowid), 0) FROM messages)), "
             "urgent_rowid = MIN(urgent_rowid, (SELECT COALESCE(MAX(rowid), 0) FROM messages))");
         database_.execute(
             "UPDATE wake_hooks SET seen_message_rowid = MIN(seen_message_rowid, (SELECT COALESCE(MAX(rowid), 0) FROM messages))");
@@ -343,6 +347,7 @@ json Conversations::remove(std::string_view conversation_id) {
         database_.execute("DELETE FROM artifact_refs WHERE conversation_id = ?", conversation_id);
         const std::int64_t tasks = database_.execute("DELETE FROM tasks WHERE conversation_id = ?", conversation_id);
         database_.execute("UPDATE conversation_proposals SET conversation_id = NULL WHERE conversation_id = ?", conversation_id);
+        database_.execute("DELETE FROM window_cursors WHERE conversation_id = ?", conversation_id);
         database_.execute("DELETE FROM conversation_members WHERE conversation_id = ?", conversation_id);
         database_.execute("DELETE FROM conversations WHERE conversation_id = ?", conversation_id);
         events_.append("conversation.deleted", {.project_id = project_id}, conversation_id,

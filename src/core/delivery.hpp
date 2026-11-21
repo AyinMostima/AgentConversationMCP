@@ -6,31 +6,38 @@
 // context for the model. The hook program (src/mcp/hook.mjs) calls hook() with
 // the session's own credential; this module decides what it gets to print.
 //
+// Everything here is per window (see window.hpp): each conversation of an
+// application is shown what is meant for it, keeps its own marks and is woken
+// on its own. A message without target windows is meant for every window of
+// its readers; one with targets only for those.
+//
 //   start, prompt  the conversation starts or the person sends a prompt: every
-//                  unread message that was not shown yet, newest batch first.
-//   stop           the model finished its turn: unread messages marked urgent
-//                  that were not shown yet. The client then continues the turn
-//                  with them instead of stopping.
+//                  message for this window that it has neither read nor been
+//                  shown, oldest first.
+//   stop           the model finished its turn: messages marked urgent that
+//                  were not shown yet. The client then continues the turn with
+//                  them instead of stopping.
 //   watch          a background hook that waits while the conversation is
 //                  idle and, where the client supports it, wakes the model:
-//                  same selection as stop.
+//                  same selection as stop. One watcher per window.
 //
-// A session whose client offers no way to be woken while idle is served by the
+// A window whose client offers no way to be woken from inside is served by the
 // gateway instead: claim() hands it the urgent messages together with the
-// client's own id of the conversation, the gateway starts the vendor's
-// command line for that conversation and report() records the outcome.
+// client's own id of the conversation, the gateway runs the vendor's command
+// for adding a message to that conversation and report() records the outcome.
+// A conversation the vendor says it cannot continue is not tried again.
 //
-// What was shown is tracked by row position, per session: shown_rowid for
+// What was shown is tracked by row position, per window: shown_rowid for
 // everything the start/prompt hooks printed, urgent_rowid for what any urgent
 // route delivered. Nothing is marked read here: check_in still returns the
 // messages once, so a client that dropped the hook's output loses nothing.
 // For the same reason an urgent message that is still unread at the next
 // prompt is listed there again: the urgent delivery may have reached nobody.
 //
-// Against sessions waking each other in a circle: the number of urgent
-// deliveries per session is capped per ten minutes, the idle route keeps a
+// Against windows waking each other in a circle: the number of urgent
+// deliveries per window is capped per ten minutes, the idle route keeps a
 // minimum distance between two starts and gives up after repeated failures
-// until the client is used again, and Messages caps how many messages a
+// until the window is used again, and Messages caps how many messages a
 // session may mark urgent per hour.
 #pragma once
 
@@ -38,6 +45,7 @@
 #include "database.hpp"
 #include "event_log.hpp"
 #include "identity.hpp"
+#include "window.hpp"
 
 namespace acm {
 
@@ -47,14 +55,21 @@ public:
     static constexpr std::int64_t kMaxListed = 8;
     static constexpr std::size_t kBodyBytes = 1200;
     static constexpr std::size_t kUrgentBodyBytes = 4000;
-    // Urgent deliveries (stop, watch, command) a session gets within kWindowSeconds.
+    // Urgent deliveries (stop, watch, command) a window gets within kWindowSeconds.
     static constexpr std::int64_t kMaxUrgentDeliveries = 6;
     static constexpr std::int64_t kWindowSeconds = 600;
-    // Idle route: how long after the end of a turn it may start, how long a
-    // watcher counts as alive, the distance between two starts, when a failed
-    // start is tried again, how many failures in a row end it, and after how
-    // long a start that never reported counts as lost.
+    // Idle route: how long after the end of a turn it may start, how long after
+    // a tool call a window without hooks counts as idle, how long a watcher
+    // counts as alive, the distance between two starts, when a failed start is
+    // tried again, how many failures in a row end it, and after how long a start
+    // that never reported counts as lost.
     static constexpr std::int64_t kSettleSeconds = 5;
+    // How long a window may take to show a sign of life (a hook, a tool call) after a
+    // message was handed to its application, before it is started another way; and
+    // for how long after the handing over that is still worth doing.
+    static constexpr std::int64_t kConfirmSeconds = 90;
+    static constexpr std::int64_t kConfirmWindowSeconds = 3600;
+    static constexpr std::int64_t kToolIdleSeconds = 120;
     static constexpr std::int64_t kWatchAliveSeconds = 90;
     static constexpr std::int64_t kMinIntervalSeconds = 30;
     static constexpr std::int64_t kRetrySeconds = 300;
@@ -62,16 +77,16 @@ public:
     static constexpr std::int64_t kLostSeconds = 900;
 
     Delivery(Database& database, EventLog& events, Clock clock)
-        : database_(database), events_(events), clock_(std::move(clock)) {}
+        : database_(database), events_(events), clock_(clock), windows_(database, events, clock) {}
 
-    // Hook program: {event, client?, client_session?, cwd?, watch_id?, peek?}.
-    // Returns {count, urgent, more, text, messages, superseded}. `text` is what
-    // the hook prints, empty when there is nothing to show. With peek nothing is
-    // recorded as shown.
+    // Hook program: {event, client?, client_session?, cwd?, watch_id?, fresh?, peek?}.
+    // Returns {window, count, urgent, more, text, messages, superseded}. `text`
+    // is what the hook prints, empty when there is nothing to show. With peek
+    // nothing is recorded as shown.
     json hook(const Session& session, const json& args);
 
-    // Gateway: urgent messages to deliver by starting the client's command line,
-    // for sessions that are idle and have no watcher. Each job counts as an attempt.
+    // Gateway: urgent messages to deliver by running the client's command, for
+    // windows that are idle and have no watcher. Each job counts as an attempt.
     // {clients?}: the clients the gateway has a command for; without it, all.
     // The list is remembered so the console can say which clients can be started.
     json claim(const json& args = json::object());
@@ -79,7 +94,7 @@ public:
     // Gateway: what became of a claimed job. {delivery_id, ok, detail?}
     json report(const json& args);
 
-    // Operator view, one entry per session whose client has run a hook.
+    // Operator view, one entry per session with a window, the windows inside.
     json list();
 
     // The clients the gateway last said it can start; empty before its first claim.
@@ -94,16 +109,30 @@ private:
         std::string created_at;
         std::string from;
         std::string where;
+        bool to_you;
+        // Sent to this session alone (named as its only kind of reader, or in a direct conversation).
+        bool personal = false;
+        // Written by another window of this same session.
+        bool own = false;
     };
-    std::vector<Pending> pending(std::string_view session_id, std::int64_t floor, std::int64_t urgent_floor,
+    // Messages for window `window_id` of `session_id` after row `floor`.
+    std::vector<Pending> pending(std::string_view session_id, std::string_view window_id, std::int64_t floor,
                                  bool urgent_only, std::int64_t limit);
+    // The urgent ones among them that interrupt this window: an urgent message
+    // interrupts the windows it names. One that names no window but is for a
+    // session alone (it is the only reader named, or it is that session's direct
+    // conversation) interrupts the window that session used last, once. A message
+    // to everybody interrupts nobody: it waits for each window's next prompt.
+    std::vector<Pending> interrupting(std::string_view session_id, std::string_view window_id, std::int64_t floor);
     std::int64_t last_rowid();
-    static std::string compose(const std::vector<Pending>& listed, std::int64_t more, std::string_view route);
+    static std::string compose(const std::vector<Pending>& listed, std::int64_t more, std::string_view route,
+                               std::string_view window_name);
     json view(std::string_view session_id);
 
     Database& database_;
     EventLog& events_;
     Clock clock_;
+    Windows windows_;
 };
 
 }  // namespace acm

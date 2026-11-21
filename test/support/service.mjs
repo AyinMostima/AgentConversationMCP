@@ -9,6 +9,16 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
+// These tests may themselves be run from inside a client conversation (Claude sets
+// this variable). Nothing they start may take that conversation for its own.
+delete process.env.CLAUDE_CODE_SESSION_ID;
+delete process.env.ACM_CLIENT_SESSION;
+// No test starts a real client on this machine: the command lines of Codex and
+// Antigravity are replaced by stand-ins where a test is about idle delivery.
+process.env.ACM_DISPATCH_BUILTIN = 'off';
+// Nor does a test run read the conversations this machine's own clients have on record.
+process.env.ACM_DISCOVER = 'off';
+
 export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const entry = join(repoRoot, 'src', 'mcp', 'server.mjs');
 

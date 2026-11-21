@@ -104,7 +104,7 @@ describe('MCP transport contract', { concurrency: false }, () => {
     assert.equal(info.name, 'agent-conversation-mcp');
     assert.deepEqual(names, [
       'acknowledge_message', 'bot_pull', 'bot_request', 'bot_requests', 'bot_respond', 'check_in', 'create_task', 'direct_message', 'forward_message', 'get_artifact', 'get_conversation', 'get_inbox', 'get_session',
-      'list_conversations', 'list_tasks', 'propose_conversation', 'publish_artifact', 'read_messages', 'report_progress', 'request_pairing',
+      'list_conversations', 'list_tasks', 'name_window', 'propose_conversation', 'publish_artifact', 'read_messages', 'report_progress', 'request_pairing',
       'send_message', 'update_task',
     ]);
     const send = tools.find((tool) => tool.name === 'send_message');

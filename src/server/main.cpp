@@ -118,7 +118,7 @@ int http_status(const std::string& code) {
         return 404;
     }
     if (code == "VERSION_CONFLICT" || code == "IDEMPOTENCY_CONFLICT" || code == "ALREADY_EXISTS" ||
-        code == "CONVERSATION_ARCHIVED") {
+        code == "CONVERSATION_ARCHIVED" || code == "NAME_TAKEN") {
         return 409;
     }
     if (code == "INVALID_ARGUMENT" || code == "ACTION_NOT_ALLOWED") {
@@ -320,7 +320,14 @@ private:
             return ok({{"status", "ok"}, {"version", kVersion}, {"schema_version", service_.schema_version()}});
         }
         if (path.size() == 4 && is(0, "internal") && is(1, "v1") && is(2, "tools") && method == drogon::Post) {
-            return ok(service_.call_tool(bearer_token(request), path[3], parse_body(request)));
+            // What the entry point knows about the conversation the call comes from.
+            json context = json::object();
+            for (const auto& [header, field] : {std::pair{"x-acm-client", "client"}, std::pair{"x-acm-client-session", "client_session"}}) {
+                if (const std::string& value = request->getHeader(header); !value.empty()) {
+                    context[field] = value;
+                }
+            }
+            return ok(service_.call_tool(bearer_token(request), path[3], parse_body(request), context));
         }
         if (path.size() == 3 && is(0, "internal") && is(1, "v1") && is(2, "enroll") && method == drogon::Post) {
             return ok(service_.enroll(bearer_token(request), parse_body(request)));
@@ -455,6 +462,13 @@ private:
         }
         if (resource == "sessions" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("set_session", path[3], parse_body(request)));
+        }
+        if (resource == "windows" && path.size() == 4 && method == drogon::Put) {
+            return ok(service_.admin("rename_window", path[3], parse_body(request)));
+        }
+        // Conversations the gateway found on a client's own record.
+        if (resource == "windows" && path.size() == 4 && is(3, "import") && method == drogon::Post) {
+            return ok(service_.admin("import_windows", "", parse_body(request)));
         }
         if (resource == "tasks" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("update_task", path[3], parse_body(request)));

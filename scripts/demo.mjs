@@ -415,7 +415,11 @@ async function seed() {
       throw new Error(`hook ${body.event} for ${who}: HTTP ${response.status}`);
     }
   };
-  await tool(clients.codex1, 'send_message', { conversation_id: lobby.conversation_id, body: COPY.urgentLobby, urgent: true, idempotency_key: key() });
+  // The Claude conversation is open before the urgent message arrives: a window is
+  // only interrupted by what was sent while it existed.
+  await hook('claude', { event: 'start', client: 'claude', client_session: 'demo-claude-conversation', cwd: projectRoot });
+  // Urgent interrupts whom it names: here the Claude session, whose conversation is then continued.
+  await tool(clients.codex1, 'send_message', { conversation_id: lobby.conversation_id, body: COPY.urgentLobby, urgent: true, recipient_session_ids: [sessions.claude], idempotency_key: key() });
   await hook('claude', { event: 'stop', client: 'claude', client_session: 'demo-claude-conversation', cwd: projectRoot });
   await hook('claude', { event: 'watch', client: 'claude', client_session: 'demo-claude-conversation', watch_id: 'demo-watcher', fresh: true });
   await hook('agy', { event: 'prompt', client: 'antigravity', client_session: 'demo-antigravity-conversation' });

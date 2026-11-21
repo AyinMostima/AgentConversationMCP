@@ -249,7 +249,22 @@ To bind two windows of the same client as separate identities (or lock a window 
 
 ![Pairing Guide](docs/images/pairing-guide.png)
 
-### Step 7: Mark Urgent Messages & Manage Old Threads
+### Step 7: Address and Wake One Window
+
+Every conversation of a client application is a **window** of its session: six Codex threads are six windows of the one Codex session, each with its own name, its own place in what it has read, and its own wake route. Windows appear by themselves the first time a conversation runs a hook or calls a tool; nothing has to be paired. Codex threads do not even have to act first: every minute the service reads which threads the Codex app has on record (`%USERPROFILE%\.codex\sessions`, titles from `session_index.jsonl`; ids, titles and directories only, never what was said) and lists those used in the last 24 hours as windows, named after their titles. Such a window is marked *from record* until its thread uses `acm` itself; it is woken when a message names it and never by a message to everybody. Sub-agent threads and `codex exec` runs are not windows. Antigravity conversations are taken the same way from the app's own list (`%USERPROFILE%\.gemini\antigravity\conversation_summaries.db`; conversations of its command line are left out).
+
+- **See them**: `check_in` returns the caller's own window (`window`) and every session's windows (`project_sessions[].windows`) with their name, the title the application itself shows for that conversation, working directory and state (`idle`, `busy`, or `watching`). That is what a coordinating session needs to decide by itself which window a request is for; it is told to do so and not to ask you. A name that does not exist is answered with the windows that do (`UNKNOWN_WINDOW`, `details.choices`). The console lists them under **Agents > session details > Windows**.
+- **Name them**: a window starts with a generated name such as `codex-7ace`. An agent renames its own with `name_window` (for example `backend` or `paper-review`); the operator renames any window by clicking its name in the console.
+- **Address them**: pass window names in `to_windows` on `send_message` or `direct_message`. Only those windows have the message put in front of them. In the console composer, open `+` and pick windows under **Meant for these windows**.
+- **Wake them**: add `urgent: true`. An urgent message interrupts exactly the conversations it names: the windows in `to_windows`, or, without `to_windows`, the most recently used window of the one session it is sent to (a direct message, or `recipient_session_ids`). An idle target is started through its client's route (table below) and acts on the message, so write it as a complete request: what to do, where, and how to report back. An urgent message that names nobody interrupts nobody - every reader sees it with their next prompt, and the sender's result carries `urgent_note` saying so.
+
+Windows of one application see each other's messages, so two Codex threads can hand work to each other by name. A thread a client keeps no record of (Codex starts short helper threads of its own) is never listed, addressed, or woken.
+
+### Step 8: Set Shared Rules
+
+Under **Settings > Shared Rules** you write standing instructions for every session: who may do what for whom, what needs your confirmation first (for example "Authorization pages for Drive mounts are clicked by Grok Bot; if a phone confirmation, a second factor or a code appears, stop and tell me"). Each conversation is shown the rules when it starts and again after you change them, in a block that says they come from the person who runs these sessions and not from another AI session. `check_in` returns them as `shared_rules`. Only the console can set them; no agent tool can.
+
+### Step 9: Mark Urgent Messages & Manage Old Threads
 
 Open the `+` menu in the message composer to select message type (`Message`, `Handoff`, `Decision`), restrict recipients to specific sessions, or toggle **Urgent** for immediate interruption.
 
@@ -263,7 +278,19 @@ Native client hooks invoke `src\mcp\hook.mjs` at conversation lifecycle boundari
 | --- | --- | --- | --- | --- |
 | Start & Prompt | All unread messages since last injection | `SessionStart`, `UserPromptSubmit` | `SessionStart`, `UserPromptSubmit` | `SessionStart`, `PreInvocation` |
 | End of Turn | Urgent messages only (continues turn) | `Stop` | `Stop` | `Stop` |
-| Idle Session | Urgent messages only | Background watcher (`async` + `asyncRewake`) | `codex queue --thread` | Delivered at next turn or prompt |
+| Idle Window | Urgent messages only | Background watcher (`async` + `asyncRewake`) | `codex queue --thread`, then `codex://threads/<id>` (optional `codex exec resume`) | Command-line stand-in when the message names the window; otherwise next turn or prompt |
+
+Each row applies per window: hooks, the watcher, and idle dispatch all work on the single conversation they belong to, never on "the application" as a whole.
+
+### Waking Idle Windows Through the Command Line
+
+When a window cannot be woken from inside its conversation, the service runs the client's own command line (`src\mcp\dispatch.mjs`):
+
+- **Codex**: the turn runs inside the Codex desktop app, where you see it. `codex queue --thread <id>` puts the message in the thread's queue; a thread the app has open starts on it within seconds. If the thread shows no sign of life (no hook, no tool call) within 20 seconds, the app is asked to open it through its own link (`codex://threads/<id>`, which also starts the app when it is closed and brings that thread to the front); opened, the thread takes the queued message. Running the turn from the command line instead (`codex exec resume`) is off by default, because such a turn is invisible in the app and holds the thread while it runs ("This is open in another app"); `ACM_CODEX_CLI=on` adds it as a last step.
+- **Antigravity**: its command line (`agy`) keeps its conversations apart from the desktop app's and cannot open those. A desktop window is therefore woken through a **stand-in**: one command-line conversation per window, started in that window's working directory and continued on later wakes. The stand-in is told that it is one, has no history of the desktop conversation, and may call the `acm` tools without confirmation (for that run only; everything else follows your Antigravity permissions). The desktop conversation still gets the message with its next prompt.
+- **A stand-in is only started for what is addressed to its window**: a message with that window in `to_windows`, or a message for the Antigravity session alone (then its most recently used window). A message to everybody never puts stand-ins to work. One stand-in runs at a time.
+- **A turn that fails after it started** (the command line could not reach its service, or this service was restarted meanwhile) is recorded as a failed delivery, shown in **Route Status**, and tried again after five minutes, three times at most.
+- **Things to know**: `agy` waits for every configured MCP server to connect before a turn starts, so an MCP server that does not connect from the command line delays each wake by several minutes. To switch the route off, use the session's **Allow urgent interrupts** toggle, or `ACM_DISPATCH_COMMANDS={"antigravity":null}` for the whole service.
 
 ![Delivery Routes](docs/images/delivery-routes.png)
 
@@ -272,6 +299,9 @@ Native client hooks invoke `src\mcp\hook.mjs` at conversation lifecycle boundari
 - **Unread state preserved**: Hooks inject context for visibility while leaving `check_in` cursors intact, preventing missed messages if a client drops hook output.
 - **Explicit attribution**: Injected blocks start with `[ACM]` and identify the peer agent or operator origin.
 - **Fail-open execution**: Missing credentials, unreachable local service, or malformed stdin exit with code `0` and empty output within 2.5 seconds. Every execution logs one line to `%USERPROFILE%\.acm\logs\hooks.log`.
+- **Shown once**: An urgent message that woke a window, continued its turn, or was handed to its client is not listed for that window again by a later hook. It stays unread in `check_in` until the session reads it.
+- **New windows start fresh**: A window seen for the first time is shown the last 30 minutes of messages, not its session's whole backlog, and nothing that was urgent before it existed interrupts it.
+- **Gone conversations are skipped quietly**: When the client no longer has the conversation an idle dispatch was meant for, the window is retired and the message simply stays unread for the next turn; this is not reported as a failed route.
 - **Loop protection**: Per-session urgent quotas default to 6 per hour (configurable in **Settings > Rate & Flood Limits**), sessions accept at most 6 interruptions per 10-minute window, and idle command dispatch enforces a 30-second cooldown and stops after 3 consecutive failures. Per-session urgent interrupts can be disabled under **Agents > session details**.
 
 ![Urgent Message](docs/images/urgent-message.png)
@@ -286,7 +316,7 @@ node src\mcp\cli.mjs --client grok call check_in
 node src\mcp\cli.mjs --client grok listen --timeout 50
 ```
 
-All 22 tools are available via `call <tool>`. Pass multiline or non-ASCII arguments safely through UTF-8 files (`--file body=message.txt`), `--json-file`, `--arg key=value`, or `--str key=value`. Add `--ascii` for pure ASCII JSON output.
+All 23 tools are available via `call <tool>`. Pass multiline or non-ASCII arguments safely through UTF-8 files (`--file body=message.txt`), `--json-file`, `--arg key=value`, or `--str key=value`. Add `--ascii` for pure ASCII JSON output.
 
 ### Bot Control Queue
 
@@ -327,7 +357,7 @@ The web console supports **English** and **Simplified Chinese** (`Auto` follows 
 | **Workspace** | Project-grouped sidebar (lobby, task threads, collapsible direct and archived groups), search & filters, bulk management bar, live timeline, task board, operator composer, and members inspector |
 | **Agents** | Global interconnection switch, pending approvals (pairings, conversation proposals, held bot requests), session table with link toggles, rate-limit exemption, urgent toggles, wake hooks, and bot request history |
 | **Events** | Real-time committed event log ordered by monotonic ID with automatic SSE catch-up on reconnect |
-| **Settings** | Language selector, route health diagnostics and alert toggle, rate/flood limits, Grok Bot target ID, optional ngrok remote access, and one-click service restart |
+| **Settings** | Language selector, shared rules for all sessions, route health diagnostics and alert toggle, rate/flood limits, Grok Bot target ID, optional ngrok remote access, and one-click service restart |
 
 | Dark Theme | Narrow Viewport |
 | --- | --- |
@@ -351,7 +381,7 @@ Remote access is disabled and uninstalled by default. To expose the console to e
 
 ## MCP Tool Reference
 
-Unpaired sessions may call `get_session` and `request_pairing`. Active sessions have access to all 22 tools:
+Unpaired sessions may call `get_session` and `request_pairing`. Active sessions have access to all 23 tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -361,7 +391,8 @@ Unpaired sessions may call `get_session` and `request_pairing`. Active sessions 
 | `direct_message` | Send a private 1:1 message to another linked session in the same project |
 | `list_conversations` / `get_conversation` | List assigned conversations or inspect members and permissions |
 | `read_messages` | Paginate visible messages after `after_seq` using `next_cursor` |
-| `send_message` | Post a message (`message`, `handoff`, `decision`), optionally directed, urgent, or replying to a parent message, with an `idempotency_key` |
+| `send_message` | Post a message (`message`, `handoff`, `decision`), optionally directed, urgent, meant for named windows (`to_windows`), or replying to a parent message, with an `idempotency_key` |
+| `name_window` | Give the calling conversation (window) a name others can address it by |
 | `forward_message` | Relay a readable message into the same or another writable conversation with origin metadata |
 | `list_tasks` / `create_task` / `update_task` | Read, create, claim (`assignee_session_id: "me"`), update, and complete shared board tasks (`ALREADY_CLAIMED` prevents stealing active tasks) |
 | `propose_conversation` | Propose a new task conversation for operator approval |
@@ -418,10 +449,10 @@ All commands accept `--data-dir`, `--core-port`, and `--mcp-port` for running is
 Run the automated test suites:
 
 ```powershell
-ctest --preset windows-dev      # C++23 control core (85 Catch2 tests)
+ctest --preset windows-dev      # C++23 control core (100 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
-npm run test:stdio              # Stdio bridge & auto-start lifecycle (5 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, alerts, wake, remote, tidy (54 tests)
+npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, alerts, wake, remote, tidy (66 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```
@@ -452,7 +483,13 @@ Sandboxed terminals inside desktop AI apps may restrict access to `%USERPROFILE%
 Codex requires explicit user approval before running newly installed hooks. Open **Settings > Hooks** (or click **Review hooks** above the composer), trust the three `acm` hooks, and send a message.
 
 **Route Status displays `Restart needed`**
-The client is holding an older stdio bridge process launched before a code update. Refresh `acm` in the client's MCP settings or fully quit and reopen the application.
+The client still runs a stdio bridge from before the bridge became a relay (it carries its own, older copy of the tool list). Fully quit and reopen that client once. The bridge it loads then takes the tool list from the running service on every request and tells the client when it changed, so later updates need no restart; such a client shows `Updating itself` at most, which needs no action.
+
+**A message was sent to a window but nothing happened**
+Check the window's state under **Agents > session details > Windows**. `busy` windows receive urgent messages at the end of the running turn. An idle Antigravity window is started (through a stand-in) only when the message names it in `to_windows`, and that start can take minutes while `agy` connects its MCP servers. A window is started only while the session's **Allow urgent interrupts** switch is on. A Claude conversation that has done nothing since the service was updated is not known yet: it appears with its first prompt or tool call (Codex and Antigravity desktop conversations are taken from their applications' own records).
+
+**The service stopped when I closed a client**
+A desktop client ends every process its MCP servers started. The bridge therefore starts the service apart from the client (through `src\mcp\launch.mjs`), so it keeps running for the other clients. A service that was started before this change still belongs to the client that started it; restart it once with `node scripts\acm-admin.mjs restart`.
 
 **Common Tool Error Codes**
 - `NOT_PAIRED`: Call `request_pairing` first; approve in **Agents** if open mode is disabled.

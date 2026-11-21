@@ -36,13 +36,25 @@ std::string request_hash(const Draft& draft, const std::vector<std::string>& rec
         // Only present when set, so requests stored before the flag existed keep their digest.
         canonical["urgent"] = true;
     }
+    if (!draft.to_windows.empty()) {
+        std::vector<std::string> targets;
+        for (const auto& window : draft.to_windows) {
+            targets.push_back(window.window_id);
+        }
+        std::ranges::sort(targets);
+        canonical["to_windows"] = targets;
+    }
     return sha256_hex(canonical.dump());
 }
 
 }  // namespace
 
-json Messages::send(const Session& session, const json& args) {
+json Messages::send(const Session& session, const json& args, const Window* window, std::vector<Window> to_windows) {
     Draft draft;
+    if (window != nullptr) {
+        draft.author_window_id = window->window_id;
+    }
+    draft.to_windows = std::move(to_windows);
     draft.conversation_id = require_string(args, "conversation_id", 96);
     draft.body = require_string(args, "body", kMaxBodyBytes);
     draft.kind = optional_string(args, "kind", 32).value_or("message");
@@ -53,8 +65,9 @@ json Messages::send(const Session& session, const json& args) {
     return submit({.session = &session}, draft);
 }
 
-json Messages::send_as_operator(const json& args) {
+json Messages::send_as_operator(const json& args, std::vector<Window> to_windows) {
     Draft draft;
+    draft.to_windows = std::move(to_windows);
     draft.conversation_id = require_string(args, "conversation_id", 96);
     draft.body = require_string(args, "body", kMaxBodyBytes);
     draft.kind = optional_string(args, "kind", 32).value_or("message");
@@ -176,6 +189,18 @@ json Messages::submit(const Author& author, const Draft& draft,
             recipients = explicit_recipients;
         }
 
+        // A window can only be told what its session may read. Another window of the
+        // writer's own application is such a window: that is how two conversations of
+        // one application hand work to each other.
+        for (const auto& target : draft.to_windows) {
+            const bool sibling = author.session != nullptr && target.session_id == author.session->session_id;
+            if (!sibling && std::ranges::find(recipients, target.session_id) == recipients.end()) {
+                fail("INVALID_RECIPIENT",
+                     std::format("window {} belongs to a session that is not a reader of this message", target.name),
+                     {{"window", target.name}, {"session_id", target.session_id}});
+            }
+        }
+
         if (draft.reply_to_message_id) {
             Statement parent = database_.query(
                 "SELECT m.directed, m.sender_session_id FROM messages m WHERE m.message_id = ? AND "
@@ -205,12 +230,16 @@ json Messages::submit(const Author& author, const Draft& draft,
         const std::string id = new_id("msg");
         database_.execute(
             "INSERT INTO messages (message_id, conversation_id, seq, sender_kind, sender_session_id, kind, body, "
-            "payload, reply_to_message_id, directed, idempotency_key, request_hash, created_at, urgent) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "payload, reply_to_message_id, directed, idempotency_key, request_hash, created_at, urgent, "
+            "author_window_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id, draft.conversation_id, seq, sender_kind,
             author.session != nullptr ? std::optional<std::string>(sender_id) : std::nullopt, draft.kind, draft.body,
             draft.payload.is_null() ? std::optional<std::string>() : std::optional<std::string>(draft.payload.dump()),
-            draft.reply_to_message_id, !explicit_recipients.empty(), draft.idempotency_key, hash, now, urgent);
+            draft.reply_to_message_id, !explicit_recipients.empty(), draft.idempotency_key, hash, now, urgent,
+            draft.author_window_id);
+        for (const auto& target : draft.to_windows) {
+            database_.execute("INSERT INTO message_windows (message_id, window_id) VALUES (?, ?)", id, target.window_id);
+        }
         for (const auto& recipient : recipients) {
             database_.execute(
                 "INSERT INTO message_recipients (message_id, session_id, status) VALUES (?, ?, 'available')", id,
@@ -247,6 +276,13 @@ json Messages::submit(const Author& author, const Draft& draft,
     result["duplicate_suppressed"] = duplicate;
     // True when the urgent mark was dropped because this session used up its hourly number of them.
     result["urgent_downgraded"] = downgraded;
+    if (result.value("urgent", false) && result.at("to_windows").empty() && !result.value("directed", false) &&
+        conversations_.get(draft.conversation_id).value("kind", std::string()) != "direct") {
+        // An urgent message interrupts whom it names. This one names nobody.
+        result["urgent_note"] =
+            "This urgent message names no window and no session, so it interrupts nobody: every reader sees it "
+            "with their next prompt. To have one conversation act on it now, send it with to_windows.";
+    }
     // P1 stores and shares only. Pushing into a running turn needs an approved delivery (P2/P3).
     result["delivery"] = {{"action", "shared_only"}, {"approval", "not_required"}};
     return result;
@@ -457,20 +493,32 @@ json Messages::forward(const Session& session, const json& args) {
     });
 }
 
-json Messages::unread(const Session& session, std::string_view conversation_id, std::int64_t limit) {
+json Messages::unread(const Session& session, std::string_view conversation_id, std::int64_t limit,
+                      const Window* window) {
     conversations_.require_reader(session, conversation_id);
+    // A window reads from its own place. It got one for every conversation of its
+    // session when it was first seen; a conversation it has no place in yet was
+    // joined later and is new to it from the start.
     Statement cursor = database_.query(
-        "SELECT read_seq FROM conversation_members WHERE conversation_id = ? AND session_id = ?", conversation_id,
+        "SELECT CASE WHEN ?2 IS NULL THEN "
+        "(SELECT read_seq FROM conversation_members WHERE conversation_id = ?1 AND session_id = ?3) ELSE "
+        "COALESCE((SELECT read_seq FROM window_cursors WHERE window_id = ?2 AND conversation_id = ?1), 0) END",
+        conversation_id, window != nullptr ? std::optional<std::string>(window->window_id) : std::nullopt,
         session.session_id);
     cursor.step();
     json page = read(session, {{"conversation_id", std::string(conversation_id)},
                                {"after_seq", cursor.integer(0)},
                                {"limit", limit}});
-    advance_cursor(session, conversation_id, page.at("next_cursor").get<std::int64_t>());
-    // The caller already knows what it sent itself.
+    advance_cursor(session, conversation_id, page.at("next_cursor").get<std::int64_t>(), window);
+    // The caller already knows what it sent itself. What another window of the
+    // same session wrote is news to it, as far as the two can be told apart.
     json others = json::array();
     for (auto& message : page.at("messages")) {
-        if (message.at("sender").at("session_id") != json(session.session_id)) {
+        const bool same_session = message.at("sender").at("session_id") == json(session.session_id);
+        const json& author = message.at("from_window");
+        const bool told_apart = window != nullptr && !author.is_null();
+        const bool own = same_session && (!told_apart || author.at("window_id") == json(window->window_id));
+        if (!own) {
             others.push_back(std::move(message));
         }
     }
@@ -478,7 +526,24 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
     return page;
 }
 
-void Messages::advance_cursor(const Session& session, std::string_view conversation_id, std::int64_t sequence) {
+void Messages::advance_cursor(const Session& session, std::string_view conversation_id, std::int64_t sequence,
+                              const Window* window) {
+    if (window != nullptr) {
+        database_.execute(
+            "INSERT INTO window_cursors (window_id, conversation_id, read_seq) VALUES (?1, ?2, "
+            "MIN(?3, (SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?2))) "
+            "ON CONFLICT (window_id, conversation_id) DO UPDATE SET read_seq = MAX(read_seq, excluded.read_seq)",
+            window->window_id, conversation_id, sequence);
+    } else {
+        // Which of the session's windows read this is not known, so it may have been
+        // any of them: none is shown it again.
+        database_.execute(
+            "INSERT INTO window_cursors (window_id, conversation_id, read_seq) "
+            "SELECT window_id, ?2, MIN(?3, (SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?2)) "
+            "FROM windows WHERE session_id = ?1 "
+            "ON CONFLICT (window_id, conversation_id) DO UPDATE SET read_seq = MAX(read_seq, excluded.read_seq)",
+            session.session_id, conversation_id, sequence);
+    }
     database_.execute(
         "UPDATE conversation_members SET read_seq = MIN(MAX(read_seq, ?), "
         "(SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?)) "
@@ -534,9 +599,10 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
     Statement row = database_.query(
         "SELECT m.message_id, m.conversation_id, m.seq, m.sender_kind, m.sender_session_id, m.kind, m.body, "
         "m.payload, m.reply_to_message_id, m.directed, m.created_at, s.agent_id, s.label, a.provider, "
-        "a.display_name, m.forwarded_from, m.urgent FROM messages m LEFT JOIN agent_sessions s "
-        "ON s.session_id = m.sender_session_id "
-        "LEFT JOIN agents a ON a.agent_id = s.agent_id WHERE m.message_id = ?",
+        "a.display_name, m.forwarded_from, m.urgent, m.author_window_id, w.name FROM messages m "
+        "LEFT JOIN agent_sessions s ON s.session_id = m.sender_session_id "
+        "LEFT JOIN agents a ON a.agent_id = s.agent_id "
+        "LEFT JOIN windows w ON w.window_id = m.author_window_id WHERE m.message_id = ?",
         message_id);
     if (!row.step()) {
         fail("NOT_FOUND", std::format("message {} does not exist", message_id));
@@ -559,6 +625,18 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
                    {"label", nullable(row.optional_text(12))},
                    {"provider", nullable(row.optional_text(13))},
                    {"display_name", nullable(row.optional_text(14))}}}};
+    // The window that wrote it, when known, and the windows it is meant for; empty means all of them.
+    view["from_window"] = row.is_null(17) ? json(nullptr)
+                                          : json{{"window_id", row.text(17)}, {"name", row.optional_text(18).value_or("")}};
+    json targets = json::array();
+    Statement meant = database_.query(
+        "SELECT t.window_id, w.name FROM message_windows t JOIN windows w ON w.window_id = t.window_id "
+        "WHERE t.message_id = ? ORDER BY w.name",
+        message_id);
+    while (meant.step()) {
+        targets.push_back({{"window_id", meant.text(0)}, {"name", meant.text(1)}});
+    }
+    view["to_windows"] = std::move(targets);
     const json all = receipts(message_id);
     const bool viewer_is_sender =
         viewer != nullptr && view.at("sender").at("session_id") == json(viewer->session_id);

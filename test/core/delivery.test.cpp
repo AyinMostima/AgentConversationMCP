@@ -59,6 +59,15 @@ struct Fixture {
                      {"idempotency_key", "k-" + std::to_string(++next_key)}};
         if (!recipients.is_null()) {
             args["recipient_session_ids"] = recipients;
+        } else if (urgent) {
+            // An urgent message interrupts whom it names; these tests mean the two other sessions.
+            json others = json::array();
+            for (const auto* session : {&claude, &codex, &antigravity}) {
+                if (session->session_id != from.session_id) {
+                    others.push_back(session->session_id);
+                }
+            }
+            args["recipient_session_ids"] = others;
         }
         return messages.send(from, args);
     }
@@ -128,6 +137,7 @@ TEST_CASE("a prompt hook shows what is unread once and marks nothing read", "[de
 
 TEST_CASE("a message addressed to someone else is never shown", "[delivery][hook]") {
     Fixture f;
+    f.hook(f.antigravity, "prompt");
     f.say(f.codex, "for antigravity only", true, json::array({f.antigravity.session_id}));
     REQUIRE(f.hook(f.claude, "prompt").at("count") == 0);
     REQUIRE(f.hook(f.claude, "stop").at("count") == 0);
@@ -172,22 +182,208 @@ TEST_CASE("the end of a turn continues only for urgent messages, once", "[delive
     // The continued turn ends: there is nothing new, so it may stop.
     REQUIRE(f.hook(f.claude, "stop").at("count") == 0);
 
-    // The ordinary message waits for the next prompt. The urgent one is listed there
-    // again as long as nobody read it: its delivery may not have reached anyone.
+    // The ordinary message waits for the next prompt. The urgent one is not listed a
+    // second time: the turn that was continued for it had it in front of it.
     const json prompt = f.hook(f.claude, "prompt");
-    REQUIRE(prompt.at("count") == 2);
+    REQUIRE(prompt.at("count") == 1);
     REQUIRE(prompt.at("text").get<std::string>().contains("fyi"));
-    REQUIRE(prompt.at("text").get<std::string>().contains("production is down"));
+    REQUIRE_FALSE(prompt.at("text").get<std::string>().contains("production is down"));
     REQUIRE(f.hook(f.claude, "prompt").at("count") == 0);
+    // Shown is not read: until the session reads it, check_in still reports both.
+    REQUIRE(f.messages.unread(f.claude, f.lobby, 10).at("messages").size() == 2);
 
     const json view = f.delivery.list().at(0);
     REQUIRE(view.at("last_urgent").at("route") == "stop");
     REQUIRE(view.at("last_urgent").at("status") == "ok");
 }
 
+TEST_CASE("a window that was woken is not shown the same message again", "[delivery][urgent]") {
+    Fixture f;
+    const auto codex_hook = [&](const std::string& event) {
+        return f.hook(f.codex, event, {{"client", "codex"}, {"client_session", "thread-1"}});
+    };
+    codex_hook("stop");
+    f.pass(acm::Delivery::kSettleSeconds);
+    f.say(f.claude, "an ordinary note");
+    f.say(f.claude, "start the build now", true);
+
+    // Idle: the message is handed to its client, which starts a turn with it.
+    json jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("text").get<std::string>().contains("start the build now"));
+    // That turn's own prompt hook can run before the handing over is reported as done:
+    // it adds what the window has not seen, and not the message that started the turn.
+    json prompt = codex_hook("prompt");
+    REQUIRE(prompt.at("count") == 1);
+    REQUIRE(prompt.at("text").get<std::string>().contains("an ordinary note"));
+    REQUIRE_FALSE(prompt.at("text").get<std::string>().contains("start the build now"));
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}});
+    // Neither does a later prompt of that window, nor the end of its turn.
+    REQUIRE(codex_hook("prompt").at("count") == 0);
+    REQUIRE(codex_hook("stop").at("count") == 0);
+
+    // A start that failed delivered nothing: the next prompt of that window does show the message.
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    f.say(f.claude, "second urgent request", true);
+    jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", false}, {"detail", "exit code 3"}});
+    prompt = codex_hook("prompt");
+    REQUIRE(prompt.at("count") == 1);
+    REQUIRE(prompt.at("text").get<std::string>().contains("second urgent request"));
+
+    // The same for a watcher: what woke the model is not repeated with the next prompt.
+    f.hook(f.claude, "stop");
+    f.hook(f.claude, "watch", {{"watch_id", "w1"}, {"client_session", "conv-1"}, {"fresh", true}});
+    f.say(f.codex, "claude: look at this now", true);
+    REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w1"}, {"client_session", "conv-1"}}).at("count") == 1);
+    REQUIRE(f.hook(f.claude, "prompt").at("count") == 0);
+}
+
+TEST_CASE("a window is not started again while its command-line turn runs", "[delivery][urgent]") {
+    Fixture f;
+    const json first = f.hook(f.codex, "stop", {{"client", "codex"}, {"client_session", "thread-1"}});
+    const std::string window_id = first.at("window").at("window_id");
+    f.pass(acm::Delivery::kSettleSeconds);
+    f.say(f.claude, "run the long job", true);
+    json jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}, {"detail", "started; the turn is running"}});
+
+    // The turn it started is still running when the next urgent message arrives.
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    f.say(f.claude, "one more thing", true);
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}, {"busy", {window_id}}}).at("jobs").empty());
+    // Once that turn is over, the window is started for what arrived meanwhile.
+    jobs = f.delivery.claim({{"clients", {"codex"}}, {"busy", json::array()}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("text").get<std::string>().contains("one more thing"));
+    REQUIRE_FALSE(jobs.at(0).at("text").get<std::string>().contains("run the long job"));
+}
+
+TEST_CASE("a handing over that starts no turn is followed by another way of starting it", "[delivery][urgent]") {
+    Fixture f;
+    const auto codex_hook = [&](const std::string& event) {
+        return f.hook(f.codex, event, {{"client", "codex"}, {"client_session", "thread-1"}});
+    };
+    codex_hook("stop");
+    f.pass(acm::Delivery::kSettleSeconds);
+    f.say(f.claude, "start the build now", true);
+    json jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("retry") == false);
+    // The application took the message. Whether it starts a turn with it is another matter.
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}, {"expects_turn", true}});
+    f.pass(acm::Delivery::kConfirmSeconds - 5);
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+
+    // Nothing was heard from the window: it is started once more, by a command that runs the turn itself.
+    f.pass(10);
+    jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("retry") == true);
+    REQUIRE(jobs.at(0).at("text").get<std::string>().contains("start the build now"));
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}});
+    // Once, not again and again.
+    f.pass(acm::Delivery::kConfirmSeconds + acm::Delivery::kMinIntervalSeconds);
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+
+    // A window that does show a sign of life after the handing over is left alone.
+    f.say(f.claude, "and now the tests", true);
+    jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}, {"expects_turn", true}});
+    f.pass(5);
+    codex_hook("prompt");
+    codex_hook("stop");
+    f.pass(acm::Delivery::kConfirmSeconds + 10);
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+}
+
+TEST_CASE("a stand-in is started only for what is addressed to its window", "[delivery][urgent]") {
+    Fixture f;
+    const auto desktop = [&](const std::string& conversation, const std::string& event) {
+        return f.hook(f.antigravity, event, {{"client", "antigravity"}, {"client_session", conversation}});
+    };
+    const std::string paper = desktop("conv-paper", "stop").at("window").at("window_id");
+    f.pass(1);
+    const std::string figures = desktop("conv-figures", "stop").at("window").at("window_id");
+    f.pass(acm::Delivery::kSettleSeconds);
+    const json rules = {{"clients", {"antigravity"}}};
+
+    // To everybody, meant for somebody else: no stand-in goes to work in every Antigravity window.
+    f.say(f.claude, "all Codex windows: continue working", true, json::array());
+    REQUIRE(f.delivery.claim(rules).at("jobs").empty());
+    // Naming a window starts that one, and only with what names it.
+    json args = {{"conversation_id", f.lobby}, {"body", "paper: rebuild the tables"}, {"urgent", true}, {"idempotency_key", "to-paper"}};
+    f.messages.send(f.claude, args, nullptr, {acm::Window{paper, f.antigravity.session_id, "paper"}});
+    json jobs = f.delivery.claim(rules).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("window_id") == paper);
+    REQUIRE(jobs.at(0).at("text").get<std::string>().contains("rebuild the tables"));
+    REQUIRE_FALSE(jobs.at(0).at("text").get<std::string>().contains("all Codex windows"));
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}, {"stand_in", true}});
+
+    // A message for the application alone, naming no window, goes to the window it used last.
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    f.say(f.claude, "antigravity: are the figures done", true, json::array({f.antigravity.session_id}));
+    jobs = f.delivery.claim(rules).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("window_id") == figures);
+    // While that stand-in works, no other one is started for the same application ...
+    json busy = rules;
+    busy["busy_clients"] = {"antigravity"};
+    args["body"] = "paper: one more table";
+    args["idempotency_key"] = "to-paper-2";
+    f.messages.send(f.claude, args, nullptr, {acm::Window{paper, f.antigravity.session_id, "paper"}});
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    REQUIRE(f.delivery.claim(busy).at("jobs").empty());
+    // ... and one that was put off comes up again without counting as a failure.
+    jobs = f.delivery.claim(rules).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", false}, {"postponed", true}});
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    REQUIRE(f.delivery.claim(rules).at("jobs").size() == 1);
+}
+
+TEST_CASE("a stand-in acts for a window that cannot be started itself", "[delivery][urgent]") {
+    Fixture f;
+    const auto desktop = [&](const std::string& event) {
+        return f.hook(f.antigravity, event, {{"client", "antigravity"}, {"client_session", "desktop-conv"}});
+    };
+    desktop("stop");
+    f.pass(acm::Delivery::kSettleSeconds);
+    f.say(f.claude, "antigravity: build the figures", true);
+    const json jobs = f.delivery.claim({{"clients", {"antigravity"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", true}, {"stand_in", true}});
+
+    // The window is not woken for it again ...
+    f.pass(acm::Delivery::kMinIntervalSeconds + 1);
+    REQUIRE(f.delivery.claim({{"clients", {"antigravity"}}}).at("jobs").empty());
+
+    // ... unless the stand-in's turn fails after it had been reported as under way: that is a
+    // failure like any other, shown as one and tried again after the usual pause.
+    f.delivery.report({{"delivery_id", jobs.at(0).at("delivery_id")}, {"ok", false}, {"late", true}, {"detail", "agy (stand-in): exit code 1"}});
+    REQUIRE(f.delivery.list().at(0).at("last_urgent").at("status") == "failed");
+    REQUIRE(f.delivery.claim({{"clients", {"antigravity"}}}).at("jobs").empty());
+    f.pass(acm::Delivery::kRetrySeconds + 1);
+    const json again = f.delivery.claim({{"clients", {"antigravity"}}}).at("jobs");
+    REQUIRE(again.size() == 1);
+    REQUIRE(again.at(0).at("text").get<std::string>().contains("build the figures"));
+    f.delivery.report({{"delivery_id", again.at(0).at("delivery_id")}, {"ok", true}, {"stand_in", true}});
+    REQUIRE(desktop("stop").at("count") == 0);
+    // The window's own conversation has not seen the message: its next prompt lists it.
+    const json prompt = desktop("prompt");
+    REQUIRE(prompt.at("count") == 1);
+    REQUIRE(prompt.at("text").get<std::string>().contains("build the figures"));
+}
+
 TEST_CASE("urgent deliveries to one session are capped per window", "[delivery][urgent][limits]") {
     Fixture f;
     acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    // The window has to be known first: nothing urgent from before it existed interrupts it.
+    f.hook(f.claude, "prompt");
     for (std::int64_t i = 0; i < acm::Delivery::kMaxUrgentDeliveries; ++i) {
         f.say(f.codex, "urgent " + std::to_string(i), true);
         REQUIRE(f.hook(f.claude, "stop").at("count") == 1);
@@ -223,7 +419,7 @@ TEST_CASE("a session can mark only so many messages urgent per hour", "[delivery
     }
 }
 
-TEST_CASE("one watcher per session delivers urgent messages", "[delivery][watch]") {
+TEST_CASE("one watcher per window delivers urgent messages", "[delivery][watch]") {
     Fixture f;
     f.hook(f.claude, "stop");
     REQUIRE(error_code([&] { f.hook(f.claude, "watch"); }) == "INVALID_ARGUMENT");
@@ -234,13 +430,18 @@ TEST_CASE("one watcher per session delivers urgent messages", "[delivery][watch]
     // A newer watcher of the same conversation takes over; the older one is told to end.
     f.hook(f.claude, "watch", {{"watch_id", "w2"}, {"fresh", true}, {"client_session", "conv-1"}});
     REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w1"}, {"client_session", "conv-1"}}).at("superseded") == true);
-    // So is a watcher of a conversation that is no longer the one in use.
+    // A watcher of another conversation is that window's own; neither displaces the other.
     REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w3"}, {"fresh", true}, {"client_session", "conv-0"}})
-                .at("superseded") == true);
+                .at("superseded") == false);
+    REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w2"}, {"client_session", "conv-1"}}).at("superseded") == false);
 
+    // conv-1 is the conversation Claude used last: what is urgent for Claude as such wakes that one.
+    f.pass(1);
+    f.hook(f.claude, "stop");
     f.say(f.codex, "not urgent");
     REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w2"}, {"client_session", "conv-1"}}).at("count") == 0);
     f.say(f.codex, "wake up", true);
+    REQUIRE(f.hook(f.claude, "watch", {{"watch_id", "w3"}, {"client_session", "conv-0"}}).at("count") == 0);
     const json woken = f.hook(f.claude, "watch", {{"watch_id", "w2"}, {"client_session", "conv-1"}});
     REQUIRE(woken.at("count") == 1);
     REQUIRE(woken.at("text").get<std::string>().contains("wake up"));
@@ -277,7 +478,7 @@ TEST_CASE("an idle session without a watcher is handed to the gateway", "[delive
     REQUIRE(due.at(0).at("client_session") == "thread-9");
     REQUIRE(due.at(0).at("cwd") == "C:/work");
     REQUIRE(due.at(0).at("text").get<std::string>().contains("third call"));
-    REQUIRE(due.at(0).at("text").get<std::string>().contains("use only the acm tools"));
+    REQUIRE(due.at(0).at("text").get<std::string>().contains("started by ACM while the conversation was idle"));
     // Claimed is attempted: it is not handed out a second time.
     f.pass(120);
     REQUIRE(f.jobs().empty());
@@ -288,7 +489,7 @@ TEST_CASE("an idle session without a watcher is handed to the gateway", "[delive
     f.pass(600);
     REQUIRE(f.jobs().empty());
     // Delivered this way, it is not repeated as urgent at the next turn end.
-    REQUIRE(f.hook(f.codex, "stop", {{"client", "codex"}}).at("count") == 0);
+    REQUIRE(f.hook(f.codex, "stop", {{"client", "codex"}, {"client_session", "thread-9"}}).at("count") == 0);
     REQUIRE(error_code([&] { f.delivery.report({{"delivery_id", 9999}, {"ok", true}}); }) == "NOT_FOUND");
 }
 
@@ -303,7 +504,7 @@ TEST_CASE("the idle route respects the switch, a watcher and repeated failure", 
     f.identity.set_urgent_dispatch(f.codex.session_id, true);
 
     // A live watcher delivers inside the conversation.
-    f.hook(f.codex, "watch", {{"client", "codex"}, {"watch_id", "w1"}, {"fresh", true}, {"peek", true}});
+    f.hook(f.codex, "watch", {{"client", "codex"}, {"client_session", "thread-9"}, {"watch_id", "w1"}, {"fresh", true}, {"peek", true}});
     REQUIRE(f.jobs().empty());
     f.pass(acm::Delivery::kWatchAliveSeconds + 1);
 

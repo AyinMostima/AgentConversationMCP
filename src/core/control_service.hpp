@@ -15,6 +15,7 @@
 #include "message.hpp"
 #include "progress.hpp"
 #include "wake.hpp"
+#include "window.hpp"
 
 #include <filesystem>
 #include <mutex>
@@ -28,7 +29,11 @@ public:
                             Clock clock = [] { return std::chrono::system_clock::now(); });
 
     // Agent entry. `tool` is one of the names in agent_tools().
-    json call_tool(std::string_view token, std::string_view tool, const json& args);
+    // `context` is what the entry point knows about the caller beyond its
+    // credential: {client?, client_session?}, the application and its own id of
+    // the conversation the call comes from. It selects the caller's window.
+    json call_tool(std::string_view token, std::string_view tool, const json& args,
+                   const json& context = json::object());
 
     // Bridge entry: self-enrollment of a credential the bridge generated itself.
     // See Identity::enroll. An enrolled, linked session also joins its lobby.
@@ -48,12 +53,16 @@ public:
     // Version of the tool contract: raised whenever a tool is added or removed or
     // the parameters of one change. Must equal TOOL_CONTRACT in src/mcp/tools.mjs;
     // a bridge that reports another number was started before the change.
-    static constexpr int kToolContract = 1;
+    static constexpr int kToolContract = 3;
     int schema_version();
 
 private:
     // One call that brings a session up to date: goals, task boards and unread messages.
-    json check_in(const Session& session, const json& args);
+    json check_in(const Session& session, const json& args, const Window* window);
+    // The sessions a caller can address, each with its windows.
+    json roster(const Session& session, const Window* window);
+    // The windows named in args.to_windows, resolved within the caller's project.
+    std::vector<Window> target_windows(const Session& session, const json& args);
     json settings_view();
     // Entry-point command, not part of the tool contract: a session sets up, tests,
     // inspects or removes the signal that triggers it from outside. {op, url?, key?, include_text?}
@@ -73,6 +82,8 @@ private:
     BotControl bots_;
     WakeHooks wake_;
     Delivery delivery_;
+    Windows windows_;
+    Clock clock_;
 };
 
 }  // namespace acm

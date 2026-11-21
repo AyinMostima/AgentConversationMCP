@@ -111,7 +111,7 @@ describe('command-line entry and bot control', { concurrency: false }, () => {
     assert.equal(who.document.result.agent.display_name, 'Grok Bot');
     // It starts without flood limits, and its entry point reports how many tools it offers.
     assert.equal(who.document.result.rate_exempt, true);
-    assert.equal(who.document.result.bridge_tools, 22);
+    assert.equal(who.document.result.bridge_tools, 23);
     // The entry point and the control service must agree on the version of the tool contract.
     assert.equal(who.document.result.self_enrolled, true);
     assert.equal(who.document.result.bridge_contract, (await service.admin('GET', '/api/v1/bootstrap')).tool_contract);
@@ -121,7 +121,7 @@ describe('command-line entry and bot control', { concurrency: false }, () => {
     assert.equal((await cli('grok', 'call', 'get_session')).document.result.session_id, sessions.grok);
 
     const tools = (await cli('grok', 'tools')).document.result;
-    assert.equal(tools.length, 22);
+    assert.equal(tools.length, 23);
     assert.deepEqual(tools.find((tool) => tool.name === 'bot_respond').fields.filter((entry) => entry.required).map((entry) => entry.name), ['request_id', 'result']);
 
     // Long and non-ASCII text travels in a file, so no shell can mangle it.

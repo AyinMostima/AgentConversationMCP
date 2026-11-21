@@ -47,7 +47,15 @@ describe('starting the service', { concurrency: false }, () => {
     const ports = { mcpPort: await freePort(), corePort: await freePort() };
     const service = await startService({ dataDir, ...ports });
     cleanup.push(() => service.stop());
-    const before = await service.admin('GET', '/api/v1/bootstrap');
+    // The gateway reports a few things of its own right after starting (the state of
+    // remote access, for one): wait until that has settled before comparing.
+    let before = await service.admin('GET', '/api/v1/bootstrap');
+    for (let quiet = 0; quiet < 3; ) {
+      await new Promise((done) => setTimeout(done, 200));
+      const now = await service.admin('GET', '/api/v1/bootstrap');
+      quiet = now.event_watermark === before.event_watermark ? quiet + 1 : 0;
+      before = now;
+    }
 
     const again = await secondStart(dataDir, ports);
     assert.equal(again.code, 0);
@@ -79,8 +87,13 @@ describe('starting the service', { concurrency: false }, () => {
       assert.equal(JSON.parse(stdout).result.status, 'active');
     }
     // One service, which nobody knocked over on the way.
-    const log = readFileSync(join(dataDir, 'logs', 'service.log'), 'utf8');
-    assert.equal(log.match(/acm-mcp \S+ listening/g).length, 1);
+    // The clients were answered by the control service; the gateway writes its own line a moment later.
+    let log = '';
+    for (let attempt = 0; attempt < 50 && !/acm-mcp \S+ listening/.test(log); attempt += 1) {
+      await new Promise((done) => setTimeout(done, 100));
+      log = readFileSync(join(dataDir, 'logs', 'service.log'), 'utf8');
+    }
+    assert.equal((log.match(/acm-mcp \S+ listening/g) ?? []).length, 1);
     assert.ok(!log.includes('exited unexpectedly') && !log.includes('EADDRINUSE'), log);
     const token = readFileSync(join(dataDir, 'admin-token.txt'), 'utf8').trim();
     const state = await (await fetch(`http://127.0.0.1:${ports.corePort}/api/v1/bootstrap`, { headers: { 'x-acm-admin-token': token } })).json();

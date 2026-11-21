@@ -256,6 +256,22 @@ select {
 .brand { display: flex; align-items: center; gap: 8px; flex: none; }
 .brand-tile { fill: #131b2f; }
 .brand-tagline { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+.rules-text { width: 100%; min-height: 120px; padding: 10px 12px; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); color: var(--ink); font: inherit; line-height: 1.5; resize: vertical; }
+.rules-text:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* The conversations (windows) of a session, in its details. */
+.windows { margin: 10px 0 4px; }
+.windows-head { color: var(--muted); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.windows ul { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+.window-line { display: flex; align-items: center; gap: 10px; min-height: 30px; padding: 2px 0; border-top: 1px solid var(--rule-subtle); min-width: 0; }
+.window-name { min-width: 96px; padding: 3px 8px; border: 0; border-radius: 7px; background: var(--fill); color: var(--ink); font-size: 12px; text-align: left; cursor: text; transition: background 140ms var(--ease); }
+.window-name:hover { background: var(--fill-strong); }
+.window-edit { display: flex; align-items: center; gap: 6px; }
+.window-edit input { width: 150px; min-height: 26px; padding: 0 8px; font-size: 12px; }
+.window-edit .btn { min-height: 26px; padding: 0 9px; }
+.window-title { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.window-cwd { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 @media (max-width: 900px) { .brand-tagline { display: none; } }
 .brand-glyph { fill: #ffffff; }
 .brand-name { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }

@@ -2,7 +2,7 @@
 // (pairings, conversation proposals, held bot requests), wake hook config,
 // and client onboarding wizard.
 import { useMemo, useState } from 'react';
-import type { Agent, BotRequest, Proposal, Session } from './api';
+import type { Agent, BotRequest, Proposal, Session, WindowInfo } from './api';
 import { ConfirmDialog, Dialog, useConsole } from './App';
 import { GrokPrefillButton } from './Grok';
 import { ActionButton, CopyButton, Icon, MoreButton, Pill, ProviderMark, SESSION_TONE, Segmented, SubmitButton, Switch, formatFullTime, formatTime, useBusy } from './format';
@@ -240,11 +240,49 @@ function WakeHookForm({ session }: { session: Session }) {
   );
 }
 
-function SessionRow({ session, agent, showLink }: { session: Session; agent: Agent | undefined; showLink: boolean }) {
+const WINDOW_TONE: Record<string, string> = { idle: 'muted', busy: 'proposed', watching: 'ok' };
+
+/** One conversation of an application: its name (click to change), what it is doing, where it works. */
+function WindowLine({ window: entry }: { window: WindowInfo }) {
   const { api, run } = useConsole();
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(entry.name);
+  const [busy, track] = useBusy();
+  return (
+    <li className="window-line">
+      {editing ? (
+        <form
+          className="window-edit"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void track(run(() => api.renameWindow(entry.window_id, name.trim()), t.agents.windowRenamed(name.trim()))).then((saved) => saved !== undefined && setEditing(false));
+          }}
+        >
+          <input autoFocus value={name} aria-label={t.agents.windowRenameAria(entry.name)} spellCheck={false} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === 'Escape' && setEditing(false)} />
+          <SubmitButton busy={busy} disabled={name.trim() === '' || /[\s,"'[\]]/.test(name.trim())}>{t.agents.windowSave}</SubmitButton>
+        </form>
+      ) : (
+        <button type="button" className="window-name mono" title={t.agents.windowRenameAria(entry.name)} aria-label={t.agents.windowRenameAria(entry.name)} onClick={() => { setName(entry.name); setEditing(true); }}>
+          {entry.name}
+        </button>
+      )}
+      <Pill tone={WINDOW_TONE[entry.state] ?? 'muted'}>{t.agents.windowState[entry.state] ?? entry.state}</Pill>
+      {entry.imported && <span className="muted small" title={t.agents.windowImportedHint}>{t.agents.windowImported}</span>}
+      {entry.title !== null && entry.title !== entry.name && <span className="muted small window-title" title={entry.title}>{entry.title}</span>}
+      <span className="muted small">{formatTime(entry.last_active_at)}</span>
+      {entry.cwd !== null && <span className="muted small mono window-cwd" title={entry.cwd}>{entry.cwd}</span>}
+    </li>
+  );
+}
+
+function SessionRow({ session, agent, showLink }: { session: Session; agent: Agent | undefined; showLink: boolean }) {
+  const { api, data, run } = useConsole();
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [revoking, setRevoking] = useState(false);
+  // The single conversations of this application that were used lately.
+  const windows = data.client_hooks.find((entry) => entry.session_id === session.session_id)?.windows ?? [];
   const status = t.sessionStatus[session.status];
   const closed = session.status === 'revoked' || session.status === 'expired';
   return (
@@ -290,6 +328,16 @@ function SessionRow({ session, agent, showLink }: { session: Session; agent: Age
                 </button>
               )}
             </div>
+            {windows.length > 0 && (
+              <div className="windows" title={t.agents.windowsHint}>
+                <div className="windows-head">{t.agents.windowsTitle(windows.length)}</div>
+                <ul>
+                  {windows.map((entry) => (
+                    <WindowLine key={entry.window_id} window={entry} />
+                  ))}
+                </ul>
+              </div>
+            )}
             {session.status === 'active' && (
               <div className="switch-row" title={t.agents.rateExemptTitle}>
                 <span>{t.agents.rateExemptLabel}</span>

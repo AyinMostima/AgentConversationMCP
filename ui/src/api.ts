@@ -46,6 +46,8 @@ export interface Session {
   self_enrolled: boolean;
   /** Version of the tool contract its bridge offered when it last started; null when it has not said. */
   bridge_contract: number | null;
+  /** Whether its bridge takes the tool list from the service: such a bridge follows updates without a restart. */
+  bridge_relay: boolean;
   /** An urgent message may interrupt this session: continue its turn, or wake it while idle. */
   urgent_dispatch: boolean;
   /** Present only in the response that creates the pairing. */
@@ -110,6 +112,9 @@ export interface Message {
   directed: boolean;
   /** Marked urgent by its sender: it interrupts its readers instead of waiting for their next turn. */
   urgent: boolean;
+  /** The window that wrote it, when known, and the windows it is meant for (empty: all of them). */
+  from_window: { window_id: string; name: string } | null;
+  to_windows: { window_id: string; name: string }[];
   forwarded_from: string | null;
   created_at: string;
   sender: {
@@ -208,8 +213,26 @@ export interface DeliveryRecord {
   detail: string | null;
 }
 
+/** One conversation of an application: what others address and wake. */
+export interface WindowInfo {
+  window_id: string;
+  name: string;
+  state: 'idle' | 'busy' | 'watching';
+  last_active_at: string;
+  cwd: string | null;
+  is_you: boolean;
+  /** What its client shows as the title of the conversation, when known. */
+  title: string | null;
+  /** Known from its client's own record only; woken when a message names it. */
+  imported: boolean;
+}
+
 export interface ClientHook {
   session_id: string;
+  /** The conversations of this application that were used in the last day. */
+  windows: WindowInfo[];
+  /** Whether any of them ran a hook; tool calls alone also make a window known. */
+  hooked: boolean;
   client: string;
   /** The last point of the conversation the client reported. */
   event: 'start' | 'prompt' | 'stop';
@@ -251,7 +274,7 @@ export interface Bootstrap {
   conversations: Conversation[];
   sessions: Session[];
   proposals: Proposal[];
-  settings: { open_mode: boolean; message_rate_per_minute: number; message_rate_per_hour: number; duplicate_window_seconds: number; urgent_per_hour: number; alerts_enabled: boolean; grok_bot_id: string };
+  settings: { open_mode: boolean; message_rate_per_minute: number; message_rate_per_hour: number; duplicate_window_seconds: number; urgent_per_hour: number; shared_rules: string; shared_rules_at: string; alerts_enabled: boolean; grok_bot_id: string };
   bot_requests: BotRequest[];
   wake_hooks: WakeHook[];
   client_hooks: ClientHook[];
@@ -302,7 +325,9 @@ export interface Api {
   setLinked(sessionId: string, linked: boolean): Promise<Session>;
   setRateExempt(sessionId: string, exempt: boolean): Promise<Session>;
   setUrgentDispatch(sessionId: string, enabled: boolean): Promise<Session>;
+  renameWindow(windowId: string, name: string): Promise<{ window_id: string; name: string }>;
   setAlerts(enabled: boolean): Promise<Bootstrap['settings']>;
+  setSharedRules(text: string): Promise<Bootstrap['settings']>;
   createConversation(body: { project_id: string; task_code: string; title: string; purpose?: string }): Promise<Conversation>;
   updateConversation(conversationId: string, body: { title?: string; task_code?: string; purpose?: string; archived?: boolean }): Promise<Conversation>;
   /** Deletes messages for good: all of them, or those older than that many days. */
@@ -316,7 +341,7 @@ export interface Api {
   messages(conversationId: string, afterSeq: number, limit: number): Promise<MessagePage>;
   sendMessage(
     conversationId: string,
-    body: { body: string; kind: string; recipient_session_ids?: string[]; urgent?: boolean; idempotency_key: string },
+    body: { body: string; kind: string; recipient_session_ids?: string[]; urgent?: boolean; to_windows?: string[]; idempotency_key: string },
   ): Promise<Message>;
   setGoal(conversationId: string, goal: string | null): Promise<Conversation>;
   tasks(conversationId: string): Promise<{ tasks: Task[] }>;
@@ -359,7 +384,9 @@ export function createApi(token: string): Api {
     setLinked: (id, linked) => request('PUT', `/api/v1/sessions/${id}`, { linked }),
     setRateExempt: (id, exempt) => request('PUT', `/api/v1/sessions/${id}`, { rate_exempt: exempt }),
     setUrgentDispatch: (id, enabled) => request('PUT', `/api/v1/sessions/${id}`, { urgent_dispatch: enabled }),
+    renameWindow: (id, name) => request('PUT', `/api/v1/windows/${id}`, { name }),
     setAlerts: (enabled) => request('PUT', '/api/v1/settings', { alerts_enabled: enabled }),
+    setSharedRules: (text) => request('PUT', '/api/v1/settings', { shared_rules: text }),
     createConversation: (body) => request('POST', '/api/v1/conversations', body),
     setMembers: (id, expectedVersion, members) =>
       request('PUT', `/api/v1/conversations/${id}/members`, { expected_version: expectedVersion, members }),

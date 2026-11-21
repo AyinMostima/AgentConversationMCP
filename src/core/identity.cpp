@@ -202,6 +202,9 @@ json Identity::enroll(std::string_view token, const json& args) {
     const auto bridge_tools = optional_integer(args, "bridge_tools", 0, 10000);
     // Which version of the tool contract it offers: the same number of tools can still differ in parameters.
     const auto bridge_contract = optional_integer(args, "bridge_contract", 0, 1000000);
+    // Whether it takes the tool list from the service each time its client asks (then
+    // the two numbers above say what the client was last given, not what the bridge carries).
+    const bool bridge_relay = optional_bool(args, "bridge_relay", false);
     const auto moment = clock_();
     const auto now = to_rfc3339(moment);
     const auto expires_at = to_rfc3339(moment + std::chrono::seconds(kDefaultPairingTtlSeconds));
@@ -283,8 +286,8 @@ json Identity::enroll(std::string_view token, const json& args) {
         // now replaces what an earlier start of it reported.
         database_.execute(
             "UPDATE agent_sessions SET last_seen_at = ?, self_enrolled = 1, bridge_tools = COALESCE(?, bridge_tools), "
-            "bridge_contract = ? WHERE session_id = ?",
-            now, bridge_tools, bridge_contract, session_id);
+            "bridge_contract = ?, bridge_relay = ? WHERE session_id = ?",
+            now, bridge_tools, bridge_contract, static_cast<std::int64_t>(bridge_relay ? 1 : 0), session_id);
         return session_row(session_id);
     });
 }
@@ -477,7 +480,7 @@ json Identity::session_row(std::string_view session_id) {
         "SELECT session_id, agent_id, project_id, label, status, binding_version, pairing_expires_at, "
         "claimed_client_kind, claimed_cwd, claimed_run_id, external_session_id, created_at, requested_at, "
         "approved_at, revoked_at, last_seen_at, linked, rate_exempt, host_seen_at, bridge_tools, urgent_dispatch, "
-        "self_enrolled, bridge_contract FROM agent_sessions WHERE session_id = ?",
+        "self_enrolled, bridge_contract, bridge_relay FROM agent_sessions WHERE session_id = ?",
         session_id);
     if (!row.step()) {
         fail("NOT_FOUND", std::format("session {} does not exist", session_id));
@@ -507,7 +510,9 @@ json Identity::session_row(std::string_view session_id) {
             {"urgent_dispatch", row.integer(20) != 0},
             // Whether it comes through a bridge (it registered itself), and the tool contract that bridge offers.
             {"self_enrolled", row.integer(21) != 0},
-            {"bridge_contract", row.is_null(22) ? json(nullptr) : json(row.integer(22))}};
+            {"bridge_contract", row.is_null(22) ? json(nullptr) : json(row.integer(22))},
+            // A relay bridge follows the service: new tools reach its client without a restart.
+            {"bridge_relay", row.integer(23) != 0}};
 }
 
 }  // namespace acm

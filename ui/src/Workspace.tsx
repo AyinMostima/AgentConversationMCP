@@ -217,7 +217,10 @@ function MessageItem({ message, members, parent }: { message: Message; members: 
       <div className="msg-main">
         <header className="msg-head">
           <span className="msg-author">{senderName(message, t)}</span>
-          {message.sender.label !== null && <span className="msg-label">{message.sender.label}</span>}
+          {message.sender.label !== null && <span className="msg-label">{message.sender.label}{message.from_window !== null && ` · ${message.from_window.name}`}</span>}
+          {message.to_windows.length > 0 && (
+            <span className="tag" title={t.workspace.toWindowsTitle}>{t.workspace.toWindows(message.to_windows.map((entry) => entry.name).join(t.common.sep))}</span>
+          )}
           {showTag && <span className="tag">{t.messageKind[message.kind]}</span>}
           {message.urgent && <span className="tag tag-urgent" title={t.workspace.urgentTagTitle}>{t.workspace.urgentTag}</span>}
           {message.directed && (
@@ -256,18 +259,23 @@ function MessageItem({ message, members, parent }: { message: Message; members: 
 }
 
 function Composer({ conversation }: { conversation: Conversation }) {
-  const { api, run } = useConsole();
+  const { api, data, run } = useConsole();
   const { t } = useI18n();
   const [body, setBody] = useState('');
   const [kind, setKind] = useState('message');
   const [recipients, setRecipients] = useState<string[]>([]);
+  // Windows the message is meant for, by id; empty means every window of the readers.
+  const [toWindows, setToWindows] = useState<string[]>([]);
   const [urgent, setUrgent] = useState(false);
   const [options, setOptions] = useState(false);
   const [sending, setSending] = useState(false);
   const draft = useRef({ signature: '', key: '' });
   const readers = conversation.members.filter((member) => member.can_read);
+  // The windows of the sessions that can read here: a message can be meant for some of them only.
+  const windows = readers.flatMap((member) => (data.client_hooks.find((entry) => entry.session_id === member.session_id)?.windows ?? []).map((entry) => ({ ...entry, owner: member.display_name })));
   useEffect(() => {
     setRecipients([]);
+    setToWindows([]);
     setKind('message');
     setUrgent(false);
     setOptions(false);
@@ -278,21 +286,23 @@ function Composer({ conversation }: { conversation: Conversation }) {
     if (text === '' || sending) {
       return;
     }
-    const signature = JSON.stringify([conversation.conversation_id, text, kind, recipients, urgent]);
+    const signature = JSON.stringify([conversation.conversation_id, text, kind, recipients, urgent, toWindows]);
     if (draft.current.signature !== signature) {
       draft.current = { signature, key: crypto.randomUUID() };
     }
     setSending(true);
-    const sent = await run(() => api.sendMessage(conversation.conversation_id, { body: text, kind, recipient_session_ids: recipients.length > 0 ? recipients : undefined, urgent: urgent || undefined, idempotency_key: draft.current.key }));
+    const sent = await run(() => api.sendMessage(conversation.conversation_id, { body: text, kind, recipient_session_ids: recipients.length > 0 ? recipients : undefined, urgent: urgent || undefined, to_windows: toWindows.length > 0 ? toWindows : undefined, idempotency_key: draft.current.key }));
     setSending(false);
     if (sent !== undefined) {
       setBody('');
       setUrgent(false);
+      setToWindows([]);
     }
   };
   const choices: string[] = [];
   if (kind !== 'message') choices.push(t.messageKind[kind]);
   if (recipients.length > 0) choices.push(t.workspace.composerOnlyN(recipients.length));
+  if (toWindows.length > 0) choices.push(t.workspace.composerWindowsN(toWindows.length));
   if (urgent) choices.push(t.workspace.urgentTag);
 
   return (
@@ -345,6 +355,20 @@ function Composer({ conversation }: { conversation: Conversation }) {
                 );
               })}
             </fieldset>
+            {windows.length > 0 && (
+              <fieldset className="recipients">
+                <legend>{t.workspace.composerWindowsLegend}</legend>
+                {windows.map((entry) => {
+                  const picked = toWindows.includes(entry.window_id);
+                  return (
+                    <button key={entry.window_id} type="button" className={`pick ${picked ? 'is-on' : ''}`} aria-pressed={picked} title={entry.cwd ?? undefined} onClick={() => setToWindows((current) => (picked ? current.filter((id) => id !== entry.window_id) : [...current, entry.window_id]))}>
+                      {picked && <Icon name="check" size={12} />}
+                      {entry.owner} · {entry.name}
+                    </button>
+                  );
+                })}
+              </fieldset>
+            )}
           </div>
         )}
         <div className="composer-bar">

@@ -24,6 +24,7 @@ add_library(acm_core STATIC
     src/core/settings.cpp
     src/core/wake.cpp
     src/core/delivery.cpp
+    src/core/window.cpp
 )
 target_include_directories(acm_core PUBLIC src)
 target_link_libraries(acm_core PUBLIC unofficial::sqlite3::sqlite3 nlohmann_json::nlohmann_json PRIVATE bcrypt)
@@ -55,4 +56,5 @@ if(BUILD_TESTING)
 acm_core_test(bot_control)
 acm_core_test(wake)
 acm_core_test(delivery)
+    acm_core_test(window)
 endif()

@@ -13,10 +13,12 @@ import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { HOST, VERSION, buildMcpServer, createCoreClient } from './mcp-server.mjs';
+import { HOST, VERSION, buildMcpServer, conversationOf, createCoreClient } from './mcp-server.mjs';
+import { TOOL_CONTRACT } from './tools.mjs';
 import { resolveDataDir } from './paths.mjs';
 import { ngrokComponent, startRemoteAccess } from './remote.mjs';
 import { startAlerts } from './alerts.mjs';
+import { startDiscovery } from './discover.mjs';
 import { startDispatcher } from './dispatch.mjs';
 import { startWakeDispatcher } from './wake.mjs';
 
@@ -90,8 +92,17 @@ async function handleMcp(request, response) {
     });
     return;
   }
+  // A stdio bridge that relays here says which application it serves and, when its
+  // client told it, which conversation; both only label the caller's own windows.
+  const said = (name) => {
+    const value = request.headers[name];
+    return typeof value === 'string' && value !== '' ? value.slice(0, 250) : undefined;
+  };
+  const client = /^[a-z0-9-]{1,32}$/.test(said('x-acm-client') ?? '') ? said('x-acm-client') : undefined;
+  const hint = said('x-acm-client-session');
+  const origin = (meta) => ({ client, clientSession: conversationOf(meta, hint) });
   // Reject unknown and revoked credentials at the door, before any MCP exchange.
-  const session = await callCore(token, 'get_session', {});
+  const session = await callCore(token, 'get_session', {}, origin(undefined));
   if (!session.ok && (session.status === 401 || session.status === 503)) {
     sendJson(response, session.status, rpcError(-32001, `${session.error.code}: ${session.error.message}`));
     return;
@@ -104,7 +115,9 @@ async function handleMcp(request, response) {
     return;
   }
   // A fresh MCP server per request keeps the endpoint stateless; the credential is the only context.
-  const server = buildMcpServer((tool, args) => callCore(token, tool, args));
+  const server = buildMcpServer((tool, args, meta) => callCore(token, tool, args, origin(meta)));
+  // Lets a relaying bridge notice that the tools changed since its client last listed them.
+  response.setHeader('x-acm-contract', String(TOOL_CONTRACT));
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   response.on('close', () => {
     void transport.close();
@@ -148,6 +161,7 @@ if (takeover) {
 let stopping = false;
 let stopWake = () => undefined;
 let stopDispatch = () => undefined;
+let stopDiscovery = () => undefined;
 let stopAlerts = () => undefined;
 let stopRemote = async () => undefined;
 const coreArgs = [
@@ -261,7 +275,9 @@ async function stop(exitCode) {
   }
   stopping = true;
   stopWake();
-  stopDispatch();
+  // Before the control service goes: turns started from here are reported as cut short.
+  await stopDispatch();
+  stopDiscovery();
   stopAlerts();
   await stopRemote();
   http.close();
@@ -319,9 +335,21 @@ try {
   stopDispatch = startDispatcher({
     coreUrl,
     adminToken,
+    dataDir: options.dataDir,
     intervalMs: Number(process.env.ACM_DISPATCH_INTERVAL_MS ?? 5000),
+    graceMs: Number(process.env.ACM_DISPATCH_GRACE_MS ?? 10000),
     say: (line) => console.log(`[OK] ${line}`),
   });
+  // Conversations a client has on record become windows without having to act first.
+  // ACM_DISCOVER=off is for tests, which must not read this machine's own record.
+  if (process.env.ACM_DISCOVER !== 'off') {
+    stopDiscovery = startDiscovery({
+      coreUrl,
+      adminToken,
+      intervalMs: Number(process.env.ACM_DISCOVER_INTERVAL_MS ?? 60000),
+      say: (line) => console.log(`[OK] ${line}`),
+    });
+  }
   // A system notification when a route stopped working. ACM_ALERTS=off is for tests.
   if (process.env.ACM_ALERTS !== 'off') {
     stopAlerts = startAlerts({

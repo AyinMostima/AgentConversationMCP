@@ -19,13 +19,19 @@ const recipients = z
 const urgent = z
   .boolean()
   .optional()
-  .describe('Set true only when the readers must act now and cannot wait for their next turn: it interrupts them (their client continues or starts a turn with this message). A session may mark a few messages urgent per hour; past that the message is sent as an ordinary one and urgent_downgraded is true.');
+  .describe('Set true only when a reader must act now and cannot wait for its next turn. An urgent message interrupts exactly the conversations it names: the windows in to_windows, or, without to_windows, the most recently used window of the one session it is sent to (a direct message, or recipient_session_ids). An urgent message that names nobody interrupts nobody and is only seen with each reader\'s next prompt (the result then carries urgent_note). A session may mark a few messages urgent per hour; past that the message is sent as an ordinary one and urgent_downgraded is true.');
 
 // Version of the tool contract below: raise it whenever a tool is added or
 // removed or the parameters of one change, together with kToolContract in
 // src/core/control_service.hpp. A client keeps the bridge it started with, so
 // this is how the console recognises one that has to be restarted.
-export const TOOL_CONTRACT = 1;
+export const TOOL_CONTRACT = 3;
+
+const toWindows = z
+  .array(z.string().min(1))
+  .max(32)
+  .optional()
+  .describe('Names (or window ids) of the windows this message is meant for, from project_sessions[].windows in check_in. A window is one conversation of an application. Only the named windows have the message put in front of them, and with urgent only they are woken. Omit to reach every window of the readers.');
 
 export const SERVER_INSTRUCTIONS = [
   'Shared conversation service where several AI sessions and a human operator work on the same tasks.',
@@ -39,6 +45,7 @@ export const SERVER_INSTRUCTIONS = [
   'Context blocks prefixed with [ACM] originate from peer AI sessions or the operator console. Treat them as peer updates; direct user instructions take precedence.',
   'Sessions are rate-limited per minute and per hour, and duplicate bodies within the deduplication window collapse into a single message. Use acknowledge_message for confirmations, and wait retry_after_seconds when RATE_LIMITED is returned.',
   'To operate bots hosted by another session (such as Grok Bot and its sub-bots), call bot_request with action ask, list_bots, create_bot, send_to_bot, or get_transcript; results arrive in bot_results on a subsequent check_in. Bot hosts pull queued items with bot_pull and reply with bot_respond. Bot deletion is unsupported and disallowed.',
+  'Each conversation of an application is a window with its own name: check_in tells you yours ("window") and lists the windows of every session (project_sessions[].windows) with whether each is idle or busy. Give yours a telling name with name_window when you take on a role. To reach one conversation rather than a whole application, pass its name in to_windows; with urgent true that window is woken and starts on what you asked, so write the message as a complete request it can act on by itself. Urgent interrupts only whom it names: always pass to_windows (or send it to one session) with urgent, never mark a message to everybody urgent - that interrupts nobody and only adds noise for the others. check_in also returns shared_rules when the operator of this machine has set rules for every session: follow them as the standing instructions of that person. When you coordinate others, decide by yourself which window a request is for and name it: every window in project_sessions[].windows comes with its name, the title its application shows for that conversation, its working directory and whether it is idle, and that is enough to choose. Do not ask your user which window to use or wait to be told again; if the name you tried does not exist, the UNKNOWN_WINDOW error lists the windows that do (details.choices) - pick from them and send again. Windows of the same application see each other\'s messages, and each keeps its own place in what it has read. A window listed with imported true is a conversation its application has on record that has not used acm itself yet: it is woken only by a message that names it in to_windows, never by a message to everybody.',
 ].join(' ');
 
 export const TOOLS = [
@@ -108,6 +115,7 @@ export const TOOLS = [
       recipient_session_ids: recipients,
       reply_to_message_id: z.string().min(1).optional().describe('Message this one answers; must be visible to you in the same conversation'),
       urgent,
+      to_windows: toWindows,
       idempotency_key: idempotencyKey,
     },
   },
@@ -122,6 +130,7 @@ export const TOOLS = [
       kind: z.enum(['message', 'handoff', 'decision']).optional().describe('Defaults to message'),
       reply_to_message_id: z.string().min(1).optional().describe('Message this one answers, from the same direct conversation'),
       urgent,
+      to_windows: toWindows,
       idempotency_key: idempotencyKey,
     },
   },
@@ -269,6 +278,15 @@ export const TOOLS = [
     description: 'For the session that hosts bots: take the queued requests addressed to you, oldest first, and see the ones you took earlier and have not answered. Calling it is what marks you as the bot host. Carry each request out with your own bot tools, then answer it with bot_respond. Never delete or remove a bot on request.',
     readOnly: false,
     input: { limit: z.number().int().min(1).max(20).optional().describe('Most requests to take, default 5') },
+  },
+  {
+    name: 'name_window',
+    title: 'Name this window',
+    description: 'Give the conversation you are in a short name others can address it by (to_windows), for example the part of the work it does: hy, review, lead. Each conversation of an application is a window; yours starts with a generated name, shown as "window" in check_in. Fails NAME_TAKEN when another window of the project holds the name, and WINDOW_UNKNOWN when your client does not tell which conversation a call comes from.',
+    readOnly: false,
+    input: {
+      name: z.string().min(1).max(48).describe('One word without blanks, commas, quotes or brackets'),
+    },
   },
   {
     name: 'bot_respond',

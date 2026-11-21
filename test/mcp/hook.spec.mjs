@@ -45,7 +45,10 @@ async function cli(client, ...args) {
   const { stdout } = await promisify(execFile)(process.execPath, argv);
   return JSON.parse(stdout).result;
 }
-const say = (client, body, extra = {}) => cli(client, 'call', 'send_message', '--json', JSON.stringify({ conversation_id: lobby, body, idempotency_key: `k${++key}`, ...extra }));
+// An urgent message interrupts whom it names: in these tests, the other sessions as such.
+const others = (client) => Object.entries(sessions).filter(([name]) => name !== client).map(([, id]) => id);
+const say = (client, body, extra = {}) =>
+  cli(client, 'call', 'send_message', '--json', JSON.stringify({ conversation_id: lobby, body, idempotency_key: `k${++key}`, ...(extra.urgent ? { recipient_session_ids: others(client) } : {}), ...extra }));
 
 /** Runs the hook as a client would: input on stdin, resolves to {code, stdout, stderr}. */
 function hook(client, event, input, extra = [], coreArgs = instance) {
@@ -215,7 +218,7 @@ describe('client hooks and urgent delivery', { concurrency: false }, () => {
     assert.equal(thread, 'thread-9');
     assert.match(text, /^\[ACM\] Urgent: 1 message\(s\)/);
     assert.match(text, /codex and antigravity: answer now/);
-    assert.match(text, /use only the acm tools/);
+    assert.match(text, /started by ACM while the conversation was idle/);
     await waitFor(async () => (await hooksOf('codex')).last_urgent.status === 'ok', 5000, 'the outcome to be recorded');
     const state = await service.admin('GET', '/api/v1/bootstrap');
     assert.deepEqual(state.dispatch_clients, ['codex']);
@@ -241,6 +244,19 @@ describe('client hooks and urgent delivery', { concurrency: false }, () => {
     // Not lost: the next prompt in that thread shows it.
     assert.match(JSON.parse((await hook('codex', 'prompt', { session_id: 'thread-9' })).stdout).hookSpecificOutput.additionalContext, /second urgent call/);
     note('idle-command', { command: 'stand-in for codex queue', arguments: ['<thread id>', '<text>'], onlyClientsWithCommand: true, switchPerSession: true, failureRecorded: true });
+  });
+
+  it('does not take a thread Codex keeps no record of for a window', async () => {
+    // Codex runs its hooks for helper threads too; its input says where a thread's record is kept.
+    const record = join(base, 'rollout-kept.jsonl');
+    writeFileSync(record, '');
+    const before = (await hooksOf('codex')).windows.length;
+    await hook('codex', 'start', { session_id: 'thread-kept', transcript_path: record });
+    await hook('codex', 'start', { session_id: 'thread-helper', transcript_path: null });
+    await hook('codex', 'stop', { session_id: 'thread-gone', transcript_path: join(base, 'never-written.jsonl') });
+    assert.equal((await hooksOf('codex')).windows.length, before + 1, 'only the thread with a record is a window');
+    assert.match(readFileSync(join(dataDir, 'logs', 'hooks.log'), 'utf8'), /codex start shown \d+.* \[not a kept conversation\]/);
+    note('helper-threads', { withRecord: 'a window', withoutRecord: 'not addressed, not woken' });
   });
 
   it('caps how many messages a session may mark urgent', async () => {

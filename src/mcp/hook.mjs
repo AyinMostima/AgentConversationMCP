@@ -29,7 +29,7 @@
 //          --max-seconds N  (watch: how long to wait, default 14000)
 //          --interval-ms N  (watch: how often to ask, default 3000)
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveDataDir } from './paths.mjs';
@@ -54,7 +54,7 @@ function option(name, fallback) {
  * What the client told the hook about itself. Each client names the fields in
  * its own way; a hook started without input simply has none.
  */
-export function readInput(client, raw) {
+export function readInput(client, raw, event) {
   let input = {};
   try {
     const parsed = JSON.parse(raw.replace(/^﻿/, ''));
@@ -69,7 +69,28 @@ export function readInput(client, raw) {
     const workspace = Array.isArray(input.workspacePaths) ? input.workspacePaths[0] : undefined;
     return { clientSession: text(input.conversationId), cwd: text(input.cwd) ?? text(workspace) };
   }
-  return { clientSession: text(input.session_id), cwd: text(input.cwd) };
+  return { clientSession: text(input.session_id), cwd: text(input.cwd), persistent: client === 'codex' ? keeps(input, event) : undefined };
+}
+
+/**
+ * Whether the client keeps this conversation, as far as its hook input tells.
+ * Codex runs its hooks for helper threads as well (the one that names a new
+ * conversation, for example) and stores no record of those: such a thread can
+ * never be continued, so nobody should address or wake it. Its input names the
+ * record in transcript_path. Undefined when it cannot be told yet.
+ */
+function keeps(input, event) {
+  if (!('transcript_path' in input)) {
+    return undefined;
+  }
+  if (typeof input.transcript_path !== 'string' || input.transcript_path === '') {
+    return false;
+  }
+  if (existsSync(input.transcript_path)) {
+    return true;
+  }
+  // The record may be written a moment after the conversation starts; by the end of a turn it exists.
+  return event === 'stop' ? false : undefined;
 }
 
 /**
@@ -166,6 +187,13 @@ async function main() {
     }
   }
 
+  if (process.env.ACM_HOOKS === 'off') {
+    // A conversation that ACM itself started as a stand-in for another one: it is
+    // not a window of its own, and it was handed what it needs when it was started.
+    process.stdout.write(render(client, event, '').stdout);
+    return;
+  }
+
   let token = (process.env.ACM_SESSION_TOKEN ?? '').trim();
   if (token === '') {
     try {
@@ -180,7 +208,7 @@ async function main() {
     return;
   }
 
-  const input = readInput(client, await readStdin());
+  const input = readInput(client, await readStdin(), event);
 
   /** One call to the service; resolves to its result, or undefined when it cannot be reached or refuses. */
   async function ask(body) {
@@ -188,7 +216,7 @@ async function main() {
       const response = await fetch(`${coreUrl}/internal/v1/hook`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-        body: JSON.stringify({ client, client_session: input.clientSession, cwd: input.cwd, ...body }),
+        body: JSON.stringify({ client, client_session: input.clientSession, cwd: input.cwd, persistent: input.persistent, ...body }),
         signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
       });
       const envelope = await response.json();
@@ -216,7 +244,7 @@ async function main() {
       finish('');
       return;
     }
-    note(`shown ${result.count}${result.urgent > 0 ? ` (${result.urgent} urgent)` : ''}${result.held ? ' held' : ''}`);
+    note(`shown ${result.count}${result.urgent > 0 ? ` (${result.urgent} urgent)` : ''}${result.held ? ' held' : ''}${result.rules ? ' +rules' : ''}${input.persistent === false ? ' [not a kept conversation]' : ''}`);
     finish(result.text);
     return;
   }

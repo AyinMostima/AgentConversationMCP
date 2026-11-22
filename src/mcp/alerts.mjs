@@ -74,6 +74,16 @@ export function findProblems(state, now = Date.now()) {
       problems.push({ key: `dispatch-failed:${session.session_id}:${delivery.at}`, title: `AGORA: Urgent delivery failed for ${name(session)}`, text: `${delivery.detail ?? 'Unknown error'}. The message stays unread for the next turn.` });
     }
   }
+  for (const [client, mark] of Object.entries(state.client_limits ?? {})) {
+    if (mark && typeof mark.until === 'string' && Date.parse(mark.until) > now) {
+      const detail = mark.detail ? ` Vendor message: ${String(mark.detail).slice(0, 140)}` : '';
+      problems.push({
+        key: `client-quota:${client}:${mark.until}`,
+        title: `AGORA: Usage quota exhausted for ${client}`,
+        text: `Idle dispatch paused until ${mark.until}. Messages remain unread.${detail}`,
+      });
+    }
+  }
   return problems;
 }
 

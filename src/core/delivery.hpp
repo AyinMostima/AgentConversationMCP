@@ -104,6 +104,19 @@ public:
     // The clients the gateway last said it can start; empty before its first claim.
     json command_clients();
 
+    // Gateway: a client has used up its quota (its own error said so), or has it
+    // again. {client, until?, detail?}: with `until` (RFC 3339, when the vendor
+    // says it can be used again) nothing is started for that client before then;
+    // without it the mark is cleared. Returns limits().
+    json set_limit(const json& args);
+
+    // The clients that are out of quota now: {client: {until, detail, noted_at}}.
+    // Marks whose time has passed are left out.
+    json limits();
+
+    // The limit of one client, or null.
+    json limit_of(std::string_view client);
+
 private:
     struct Pending {
         std::int64_t rowid;

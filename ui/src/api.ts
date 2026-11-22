@@ -336,6 +336,8 @@ export interface Bootstrap {
   client_hooks: ClientHook[];
   /** Clients the service can hand an urgent message to while they are idle. */
   dispatch_clients: string[];
+  /** Clients that have used up their quota: nothing is started for them until `until`. */
+  client_limits?: Record<string, { until: string; detail: string; noted_at: string }>;
   remote_access: RemoteAccess;
   /** How many tools a current bridge offers. */
   tool_count: number;

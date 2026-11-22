@@ -602,11 +602,17 @@ void Messages::advance_cursor(const Session& session, std::string_view conversat
             window->window_id, conversation_id, sequence);
     } else {
         // Which of the session's windows read this is not known, so it may have been
-        // any of them: none is shown it again.
+        // any of them: none is shown it again. Except what was addressed to one window
+        // by name: that window still gets it, so its place stops before the first such
+        // message it has not read.
         database_.execute(
             "INSERT INTO window_cursors (window_id, conversation_id, read_seq) "
-            "SELECT window_id, ?2, MIN(?3, (SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?2)) "
-            "FROM windows WHERE session_id = ?1 "
+            "SELECT w.window_id, ?2, MIN(?3, (SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?2), "
+            "  COALESCE((SELECT MIN(m.seq) - 1 FROM messages m JOIN message_windows t "
+            "            ON t.message_id = m.message_id AND t.window_id = w.window_id "
+            "            WHERE m.conversation_id = ?2 AND m.seq <= ?3 AND m.seq > COALESCE((SELECT x.read_seq "
+            "              FROM window_cursors x WHERE x.window_id = w.window_id AND x.conversation_id = ?2), 0)), ?3)) "
+            "FROM windows w WHERE w.session_id = ?1 "
             "ON CONFLICT (window_id, conversation_id) DO UPDATE SET read_seq = MAX(read_seq, excluded.read_seq)",
             session.session_id, conversation_id, sequence);
     }

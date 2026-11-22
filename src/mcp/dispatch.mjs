@@ -48,7 +48,7 @@
 // conversation comes from that client's own hook, so a client that never ran a
 // hook is never started from here.
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { TOOLS } from './tools.mjs';
@@ -199,6 +199,83 @@ export function dispatchRoutes(env = process.env) {
 }
 
 /**
+ * "try again at Nov 28th, 2026 12:59 PM" (the user's local time, as Codex writes it) as a Date.
+ * Without a time it can read, an hour from `now`.
+ */
+export function retryTime(text, now = new Date()) {
+  const [, when] = /try again (?:at|after) ([A-Z][a-z]{2,8} \d{1,2}(?:st|nd|rd|th)?,? \d{4},? \d{1,2}:\d{2}(?::\d{2})? ?[AP]M)/i.exec(text ?? '') ?? [];
+  const parsed = when === undefined ? NaN : Date.parse(when.replace(/(\d)(st|nd|rd|th)/, '$1').replace(/,(?= \d{1,2}:)/, ''));
+  return Number.isNaN(parsed) ? new Date(now.getTime() + 3600_000) : new Date(parsed);
+}
+
+// What a vendor's command or record says when its quota is used up.
+const OUT_OF_QUOTA = /usage_limit_exceeded|hit your usage limit|RESOURCE_EXHAUSTED|exceeded your current quota|quota (?:has been )?exceeded/i;
+
+/**
+ * Whether Codex has used up its quota, from its own record of turns: the newest
+ * rollout files under ~/.codex/sessions. A turn that ended with
+ * usage_limit_exceeded and no turn that ended well after it means it has, until
+ * the time it named. Returns {until, detail} or undefined.
+ */
+export function codexQuota(home = homedir(), now = new Date()) {
+  const root = join(home, '.codex', 'sessions');
+  const files = [];
+  for (let back = 0; back < 14; back += 1) {
+    const day = new Date(now.getTime() - back * 86_400_000);
+    const dir = join(root, String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0'));
+    try {
+      for (const name of readdirSync(dir)) {
+        if (name.endsWith('.jsonl')) {
+          const file = join(dir, name);
+          files.push({ file, modified: statSync(file).mtimeMs });
+        }
+      }
+    } catch {
+      // No turns that day.
+    }
+  }
+  let latest;
+  for (const { file } of files.sort((a, b) => b.modified - a.modified).slice(0, 12)) {
+    let tail = '';
+    try {
+      const size = statSync(file).size;
+      const handle = openSync(file, 'r');
+      try {
+        const buffer = Buffer.alloc(Math.min(size, 256 * 1024));
+        readSync(handle, buffer, 0, buffer.length, size - buffer.length);
+        tail = buffer.toString('utf8');
+      } finally {
+        closeSync(handle);
+      }
+    } catch {
+      continue;
+    }
+    for (const line of tail.split('\n')) {
+      if (!line.includes('"task_complete"')) {
+        continue;
+      }
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const at = Date.parse(record.timestamp ?? '');
+      if (Number.isNaN(at) || (latest !== undefined && at <= latest.at)) {
+        continue;
+      }
+      const error = record.payload?.error;
+      latest = { at, exhausted: error?.codex_error_info === 'usage_limit_exceeded' || OUT_OF_QUOTA.test(error?.message ?? ''), message: error?.message ?? '' };
+    }
+  }
+  if (latest === undefined || !latest.exhausted) {
+    return undefined;
+  }
+  const until = retryTime(latest.message, new Date(latest.at));
+  return until > now ? { until: until.toISOString(), detail: latest.message.slice(0, 300) } : undefined;
+}
+
+/**
  * Runs one command without a shell. A quick one resolves to {ok, detail} when
  * it ends. A long one resolves as soon as it is clear how it started: failed
  * when it ends with an error within `graceMs`, handed over otherwise; it then
@@ -277,7 +354,7 @@ function agyAtWork() {
   }
 }
 
-export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 5000, graceMs = GRACE_MS, say, routes = dispatchRoutes(), commandLineAtWork = agyAtWork }) {
+export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 5000, graceMs = GRACE_MS, say, routes = dispatchRoutes(), commandLineAtWork = agyAtWork, checkCodexQuota = process.env.ACM_DISPATCH_BUILTIN !== 'off' }) {
   let busy = false;
   let lastProblem = '';
   // Windows whose command-line turn is still running: nothing more is started for them
@@ -400,6 +477,10 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
               remember(job.window_id, conversation);
             }
           }
+          // A turn that ended because the client's quota is used up: nothing more is started for that client.
+          if (failure !== undefined) {
+            noteQuota(job.client, output);
+          }
           if (route.long && failure !== undefined) {
             say(`${route.name} for window ${job.window} ended with ${failure}`);
             if (handedOver) {
@@ -412,6 +493,11 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
       handedOver = result.ok;
       // A quick command only hands the message over: the window still has to show that a turn started.
       outcome = { ...result, route: route.name, stand_in: result.ok && route.standIn === true, expects_turn: result.ok && !route.long, confirm_seconds: route.patience };
+      if (!result.ok && noteQuota(job.client, result.detail)) {
+        // Another route of the same client runs on the same quota.
+        outcome.quota = true;
+        break;
+      }
       if (result.ok) {
         break;
       }
@@ -425,12 +511,45 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
     return outcome;
   }
 
+  // Which clients were last reported out of quota (client -> until), and when Codex's record was last read.
+  const reportedLimits = new Map();
+  let quotaCheckedAt = 0;
+  const reportLimit = async (client, limit) => {
+    const until = limit?.until;
+    if (reportedLimits.get(client) === until) {
+      return;
+    }
+    await local('/api/v1/delivery/limit', until === undefined ? { client } : { client, until, detail: limit.detail });
+    if (until === undefined) {
+      reportedLimits.delete(client);
+      say(`${client} has quota again`);
+    } else {
+      reportedLimits.set(client, until);
+      say(`${client} has used up its quota until ${until}: nothing is started for it before then`);
+    }
+  };
+  // Record vendor quota exhaustion reported by a client command.
+  const noteQuota = (client, text) => {
+    if (OUT_OF_QUOTA.test(text ?? '')) {
+      void reportLimit(client, { until: retryTime(text).toISOString(), detail: String(text).replace(/\s+/g, ' ').slice(-300) }).catch((error) => {
+        say(`failed to record quota limit for ${client}: ${error.message}`);
+      });
+      return true;
+    }
+    return false;
+  };
+
   async function round() {
     if (busy) {
       return;
     }
     busy = true;
     try {
+      // Codex says in its own record of turns when its quota is used up; read once a minute.
+      if (routes.codex !== undefined && checkCodexQuota && Date.now() - quotaCheckedAt > 60_000) {
+        quotaCheckedAt = Date.now();
+        await reportLimit('codex', codexQuota());
+      }
       // Naming the clients also tells the console which ones can be started from here.
       // Nothing is started for Antigravity while its command line is at work, be it a stand-in of ours or not.
       const held = new Set(standingIn.keys());

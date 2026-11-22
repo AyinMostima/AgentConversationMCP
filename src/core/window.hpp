@@ -87,6 +87,8 @@ public:
     json of_session(std::string_view session_id, const Window* self, std::int64_t limit = 40);
     // How many live windows the session has in all.
     std::int64_t count_of_session(std::string_view session_id);
+    // Which client application a window belongs to (codex, claude, antigravity, ...); empty when unknown.
+    std::string client_of(std::string_view window_id);
 
     // Operator view of one window.
     json view(std::string_view window_id);

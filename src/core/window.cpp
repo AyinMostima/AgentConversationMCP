@@ -319,6 +319,11 @@ std::int64_t Windows::count_of_session(std::string_view session_id) {
     return row.integer(0);
 }
 
+std::string Windows::client_of(std::string_view window_id) {
+    Statement row = database_.query("SELECT client FROM windows WHERE window_id = ?", window_id);
+    return row.step() ? row.optional_text(0).value_or("") : std::string();
+}
+
 json Windows::of_session(std::string_view session_id, const Window* self, std::int64_t limit) {
     json windows = json::array();
     Statement rows = database_.query(

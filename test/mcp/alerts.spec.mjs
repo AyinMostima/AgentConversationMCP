@@ -122,6 +122,14 @@ describe('alerts', { concurrency: false }, () => {
     const failedDelivery = { session_id: 'ses_g', last_urgent: { route: 'command', status: 'failed', at: at(minute), detail: 'exit code 3' } };
     assert.deepEqual(keys(view({ client_hooks: [failedDelivery] })), ['dispatch-failed']);
     assert.deepEqual(keys(view({ client_hooks: [failedDelivery], sessions: [{ ...view().sessions[0], urgent_dispatch: false }] })), []);
+    // Exhausted vendor quota surfaces once until the retry time passes.
+    const future = new Date(now + 60 * minute).toISOString();
+    const past = new Date(now - 60 * minute).toISOString();
+    const quotaAlert = findProblems(view({ client_limits: { codex: { until: future, detail: 'usage limit exceeded' } } }), now);
+    assert.equal(quotaAlert.length, 1);
+    assert.equal(quotaAlert[0].key, `client-quota:codex:${future}`);
+    assert.match(quotaAlert[0].text, /usage limit exceeded/);
+    assert.deepEqual(keys(view({ client_limits: { codex: { until: past, detail: 'expired' } } })), []);
   });
 
   it('announces a refused trigger once, and only logs it when notifications are off', async () => {

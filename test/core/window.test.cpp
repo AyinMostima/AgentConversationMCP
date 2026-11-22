@@ -395,6 +395,71 @@ TEST_CASE("conversations on a client's record are windows that can be woken by n
     }
 }
 
+TEST_CASE("a window whose turn was cut off can be woken again, unless its client is out of quota", "[window][urgent]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    const acm::Window lead = f.open(f.claude, "claude", "conv-lead");
+    // A turn starts and never reports its end (the vendor stopped it: usage limit, the app closed).
+    f.hook(f.codex, "codex", "thread-cut", "prompt");
+    const acm::Window cut = f.open(f.codex, "codex", "thread-cut");
+    f.pass(60);
+    f.say(f.claude, &lead, "cut: pick it up again", true, {cut});
+    // In a turn a short while ago: it is busy, nothing is started for it.
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+    // Long after, it is idle as the roster says, and is started.
+    f.pass(acm::Windows::kTurnSeconds);
+    // Unless its client has used up its quota: then nothing is started for it until the vendor's time.
+    const std::string until = acm::to_rfc3339(f.time.clock()() + std::chrono::hours(2));
+    f.delivery.set_limit({{"client", "codex"}, {"until", until}, {"detail", "usage limit"}});
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+    REQUIRE(f.delivery.limit_of("codex").at("until") == until);
+    REQUIRE(f.delivery.limit_of("claude").is_null());
+    // When the time has passed the mark is gone by itself.
+    f.pass(2 * 3600 + 1);
+    REQUIRE(f.delivery.limits().empty());
+    const json jobs = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+    REQUIRE(jobs.size() == 1);
+    REQUIRE(jobs.at(0).at("client_session") == "thread-cut");
+    // Clearing it by hand works too, and updating retry time emits a fresh event while repeats stay quiet.
+    const std::string t1 = acm::to_rfc3339(f.time.clock()() + std::chrono::hours(1));
+    const std::string t2 = acm::to_rfc3339(f.time.clock()() + std::chrono::hours(3));
+    const auto count_events = [&](std::string_view type) {
+        acm::Statement q = f.database.query("SELECT COUNT(*) FROM events WHERE event_type = ?", type);
+        q.step();
+        return q.integer(0);
+    };
+    const std::int64_t before_exhausted = count_events("client.quota_exhausted");
+    f.delivery.set_limit({{"client", "codex"}, {"until", t1}});
+    f.delivery.set_limit({{"client", "codex"}, {"until", t1}});
+    REQUIRE(count_events("client.quota_exhausted") == before_exhausted + 1);
+    f.delivery.set_limit({{"client", "codex"}, {"until", t2}});
+    REQUIRE(count_events("client.quota_exhausted") == before_exhausted + 2);
+    const std::int64_t before_restored = count_events("client.quota_restored");
+    REQUIRE(f.delivery.set_limit({{"client", "codex"}}).empty());
+    REQUIRE(count_events("client.quota_restored") == before_restored + 1);
+}
+
+TEST_CASE("a read that cannot be placed in a window leaves what was addressed to a window unread for it", "[window][cursor]") {
+    Fixture f;
+    const acm::Window lead = f.open(f.claude, "claude", "conv-lead");
+    f.hook(f.codex, "codex", "thread-a", "stop");
+    f.hook(f.codex, "codex", "thread-b", "stop");
+    const acm::Window a = f.open(f.codex, "codex", "thread-a");
+    const acm::Window b = f.open(f.codex, "codex", "thread-b");
+    f.say(f.claude, &lead, "for everybody");
+    const json addressed = f.say(f.claude, &lead, "a: only you", false, {a});
+    const std::int64_t last = f.say(f.claude, &lead, "for everybody again").at("sequence").get<std::int64_t>();
+    // Codex catches up without saying which of its windows reads (an older bridge, a helper).
+    f.messages.advance_cursor(f.codex, f.lobby, last);
+    // Window b is shown nothing more; window a still gets what was meant for it.
+    REQUIRE(f.hook(f.codex, "codex", "thread-b", "prompt", {{"peek", true}}).at("count") == 0);
+    const json shown = f.hook(f.codex, "codex", "thread-a", "prompt", {{"peek", true}});
+    REQUIRE(shown.at("text").get<std::string>().contains("a: only you"));
+    REQUIRE_FALSE(shown.at("text").get<std::string>().contains("for everybody\n"));
+    (void)addressed;
+    (void)b;
+}
+
 TEST_CASE("an urgent message for a session goes to one of its windows, and not to the sender's others", "[window][urgent]") {
     Fixture f;
     acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});

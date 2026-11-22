@@ -269,6 +269,9 @@ function idleRoute(provider: string, hook: ClientHook, dispatchClients: string[]
 }
 
 /** Diagnostic view of all active ingress/egress routes and hook states. */
+/** Which client application a provider's desktop sessions run in, as the dispatcher names it. */
+const CLIENT_OF_PROVIDER: Record<string, string> = { openai: 'codex', google: 'antigravity', anthropic: 'claude' };
+
 function Routes() {
   const { api, data, run } = useConsole();
   const { t } = useI18n();
@@ -335,6 +338,12 @@ function Routes() {
           : failed
             ? t.settings.deliveryUrgentFailed(formatTime(ran.last_urgent!.at, t.dateLocale), ran.last_urgent!.detail ?? t.common.unknown)
             : idleRoute(provider, ran, data.dispatch_clients, watching, t);
+        // A client that has used up its quota can take no turn, however it is reached.
+        const quota = data.client_limits?.[CLIENT_OF_PROVIDER[provider] ?? ''];
+        if (quota !== undefined) {
+          routes.push({ key: `${session.session_id}-hook`, name, tone: 'danger', label: t.settings.stNoQuota, attention: true, detail: t.settings.quotaUntil(formatTime(quota.until, t.dateLocale), quota.detail) });
+          continue;
+        }
         routes.push({
           key: `${session.session_id}-hook`,
           name,

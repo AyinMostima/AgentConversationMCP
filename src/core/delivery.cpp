@@ -403,6 +403,51 @@ json Delivery::hook(const Session& session, const json& args) {
     });
 }
 
+json Delivery::limits() {
+    const auto stored = text_setting(database_, "client_limits");
+    json parsed = stored ? json::parse(*stored, nullptr, false) : json::object();
+    json current = json::object();
+    if (!parsed.is_object()) {
+        return current;
+    }
+    const auto now = to_rfc3339(clock_());
+    for (const auto& [client, mark] : parsed.items()) {
+        if (mark.is_object() && mark.value("until", std::string()) > now) {
+            current[client] = mark;
+        }
+    }
+    return current;
+}
+
+json Delivery::limit_of(std::string_view client) {
+    const json current = limits();
+    return current.contains(std::string(client)) ? current.at(std::string(client)) : json(nullptr);
+}
+
+json Delivery::set_limit(const json& args) {
+    const auto client = require_string(args, "client", 32);
+    const auto until = optional_string(args, "until", 40);
+    const auto detail = optional_string(args, "detail", 400);
+    return database_.transaction([&] {
+        json current = limits();
+        const bool had = current.contains(client);
+        const std::string previous_until = had ? current.at(client).value("until", std::string()) : std::string();
+        if (until && !until->empty()) {
+            current[client] = {{"until", *until}, {"detail", detail.value_or("")}, {"noted_at", to_rfc3339(clock_())}};
+        } else {
+            current.erase(client);
+        }
+        store_text_setting(database_, "client_limits", current.dump());
+        // Emit once on state transition or changed retry time, rather than on every poll.
+        if (until && !until->empty() && (!had || previous_until != *until)) {
+            events_.append("client.quota_exhausted", {}, client, {{"client", client}, {"until", *until}, {"detail", detail.value_or("")}});
+        } else if ((!until || until->empty()) && had) {
+            events_.append("client.quota_restored", {}, client, {{"client", client}});
+        }
+        return current;
+    });
+}
+
 json Delivery::command_clients() {
     const auto stored = text_setting(database_, "dispatch_clients");
     json parsed = stored ? json::parse(*stored, nullptr, false) : json::array();
@@ -454,19 +499,29 @@ json Delivery::claim(const json& args) {
             "WHERE s.status = 'active' AND s.linked = 1 AND s.urgent_dispatch = 1 "
             "AND w.addressable = 1 AND w.client <> '' AND w.client_session <> '-' AND w.seen_at > ? "
             // Idle: its client last reported the start of the conversation or the end of a
-            // turn; or, for a window without hooks, it has not called a tool for a while.
-            "AND ((w.event IN ('start', 'stop') AND w.seen_at <= ?) OR (w.event = 'tool' AND w.seen_at <= ?)) "
+            // turn; or, for a window without hooks, it has not called a tool for a while; or
+            // its last turn began long ago and nothing was heard since (a turn that was cut
+            // off reports no end). The roster calls such a window idle too (Windows::state_of).
+            "AND ((w.event IN ('start', 'stop') AND w.seen_at <= ?) OR (w.event = 'tool' AND w.seen_at <= ?) "
+            " OR (w.event = 'prompt' AND w.seen_at <= ?)) "
             // A live watcher delivers by itself, inside the conversation.
             "AND (w.watch_seen_at IS NULL OR w.watch_seen_at < ?) "
             "ORDER BY w.window_id",
-            ago(Windows::kLiveSeconds), ago(kSettleSeconds), ago(kToolIdleSeconds), ago(kWatchAliveSeconds));
+            ago(Windows::kLiveSeconds), ago(kSettleSeconds), ago(kToolIdleSeconds), ago(Windows::kTurnSeconds),
+            ago(kWatchAliveSeconds));
         while (rows.step()) {
             candidates.push_back({rows.text(0), rows.text(1), rows.text(2), rows.text(3), rows.optional_text(4),
                                   rows.text(5), rows.integer(6), rows.text(7)});
         }
         json jobs = json::array();
+        // A client that has used up its quota cannot run a turn: nothing is started for it
+        // until the time its vendor named. The messages stay unread meanwhile.
+        const json out_of_quota = limits();
         for (auto& candidate : candidates) {
             if (limited && std::ranges::find(clients, candidate.client) == clients.end()) {
+                continue;
+            }
+            if (out_of_quota.contains(candidate.client)) {
                 continue;
             }
             if (std::ranges::find(occupied, candidate.window_id) != occupied.end() ||

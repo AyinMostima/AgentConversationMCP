@@ -24,7 +24,7 @@ namespace {
 using acm::json;
 using Callback = std::function<void(const drogon::HttpResponsePtr&)>;
 
-constexpr const char* kVersion = "0.3.0";
+constexpr const char* kVersion = "0.4.0";
 
 struct Options {
     std::filesystem::path data_dir;
@@ -458,6 +458,10 @@ private:
             }
             if (is(3, "report")) {
                 return ok(service_.admin("delivery_report", "", parse_body(request)));
+            }
+            // A client has used up its quota, or has it again.
+            if (is(3, "limit")) {
+                return ok(service_.admin("delivery_limit", "", parse_body(request)));
             }
         }
         if (resource == "wake" && path.size() == 4 && method == drogon::Post) {

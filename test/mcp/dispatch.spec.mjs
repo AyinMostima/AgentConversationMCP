@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import { freePort, repoRoot, startService } from '../support/service.mjs';
-import { dispatchRoutes } from '../../src/mcp/dispatch.mjs';
+import { codexQuota, dispatchRoutes, retryTime } from '../../src/mcp/dispatch.mjs';
 
 const runId = randomBytes(4).toString('hex');
 const base = mkdtempSync(join(tmpdir(), `acm-dispatch-${runId}-`));
@@ -179,6 +179,29 @@ describe('idle dispatch through the clients\' command lines', { concurrency: fal
     // None of it without the command lines, and none in a test run.
     assert.deepEqual(dispatchRoutes({ USERPROFILE: join(base, 'nobody'), APPDATA: join(base, 'nobody'), LOCALAPPDATA: join(base, 'nobody') }), {});
     assert.deepEqual(dispatchRoutes({ USERPROFILE: home, APPDATA: join(home, 'AppData', 'Roaming'), LOCALAPPDATA: join(home, 'AppData', 'Local'), ACM_DISPATCH_BUILTIN: 'off' }), {});
+  });
+
+  it('reads from the record Codex keeps when its quota is used up, and until when', () => {
+    const home = join(base, 'quota-home');
+    const now = new Date('2026-11-22T12:00:00Z');
+    const day = join(home, '.codex', 'sessions', '2026', '11', String(now.getDate()).padStart(2, '0'));
+    mkdirSync(day, { recursive: true });
+    const turn = (at, error) => JSON.stringify({ timestamp: at, type: 'event_msg', payload: { type: 'task_complete', ...(error === undefined ? {} : { error }) } });
+    const limit = { message: 'You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 28th, 2026 12:59 PM.', codex_error_info: 'usage_limit_exceeded' };
+    writeFileSync(join(day, 'rollout-a.jsonl'), `${turn('2026-11-22T03:00:00Z')}
+${turn('2026-11-22T04:00:41Z', limit)}
+`);
+    const found = codexQuota(home, now);
+    assert.equal(found.until, new Date('Nov 28, 2026 12:59 PM').toISOString());
+    assert.match(found.detail, /usage limit/);
+    // A turn that ended well after it, in any thread, means the quota is back.
+    writeFileSync(join(day, 'rollout-b.jsonl'), `${turn('2026-11-22T05:00:00Z')}
+`);
+    assert.equal(codexQuota(home, now), undefined);
+    // A time that has passed is no limit either; one that cannot be read counts as an hour.
+    assert.equal(codexQuota(home, new Date('2026-12-01T00:00:00Z')), undefined);
+    assert.equal(retryTime('quota exceeded', now).toISOString(), '2026-11-22T13:00:00.000Z');
+    assert.equal(codexQuota(join(base, 'nobody'), now), undefined);
   });
 
   it('falls back to the next command, and wakes Antigravity through a stand-in when its window is named', async () => {

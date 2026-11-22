@@ -11,5 +11,5 @@ $vcpkgRoot = $installs | ForEach-Object { Join-Path $_ 'VC\vcpkg' } | Where-Obje
     Sort-Object { (Get-Item -LiteralPath (Join-Path $_ 'vcpkg.exe')).LastWriteTimeUtc } -Descending | Select-Object -First 1
 if (-not $vcpkgRoot) { throw 'No Visual Studio 2022 instance with the vcpkg component was found.' }
 $env:VCPKG_ROOT = $vcpkgRoot
-$env:X_VCPKG_ASSET_SOURCES = 'clear;x-script,curl.exe -L --fail --retry 5 --retry-delay 2 {url} --output {dst};x-block-origin'
+$env:X_VCPKG_ASSET_SOURCES = 'clear;x-script,curl.exe -L --fail --create-dirs --retry 5 --retry-delay 2 {url} --output {dst};x-block-origin'
 Write-Output "[OK] VCPKG_ROOT=$env:VCPKG_ROOT"

@@ -214,6 +214,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
                 {"client_hooks", delivery_.list()},
                 // Clients the gateway can start for an urgent message while they are idle.
                 {"dispatch_clients", delivery_.command_clients()},
+                // Clients that have used up their quota, and until when (their vendor's word).
+                {"client_limits", delivery_.limits()},
                 {"remote_access", remote_view()},
                 // What a current bridge offers; a session reporting another number runs an older bridge.
                 {"tool_count", agent_tools().size()},
@@ -462,6 +464,9 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     }
     if (operation == "delivery_report") {
         return delivery_.report(args);
+    }
+    if (operation == "delivery_limit") {
+        return json{{"client_limits", delivery_.set_limit(args)}};
     }
     if (operation == "approve_bot_request" || operation == "reject_bot_request") {
         return bots_.decide(target_id, operation == "approve_bot_request");
@@ -722,11 +727,21 @@ json ControlService::compact(const Session* session, const json& args, const std
 
 json ControlService::roster(const Session& session, const Window* window, bool all_windows) {
     json sessions = conversations_.roster(session);
+    const json active_limits = delivery_.limits();
     for (auto& entry : sessions) {
         // The single conversations of that application, each addressable by its name. The
         // most recently used ones by default: a full list of dozens costs every reader.
         const std::string id = entry.at("session_id").get<std::string>();
         entry["windows"] = windows_.of_session(id, window, all_windows ? 40 : Windows::kRosterWindows);
+        if (!active_limits.empty()) {
+            for (const auto& listed : entry.at("windows")) {
+                const std::string client = windows_.client_of(listed.at("window_id").get<std::string>());
+                if (!client.empty() && active_limits.contains(client)) {
+                    entry["out_of_quota"] = active_limits.at(client);
+                    break;
+                }
+            }
+        }
         const std::int64_t more = windows_.count_of_session(id) - static_cast<std::int64_t>(entry.at("windows").size());
         if (more > 0) {
             // check_in with all_windows true lists these too.

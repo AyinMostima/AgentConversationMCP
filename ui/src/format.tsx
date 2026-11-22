@@ -72,9 +72,18 @@ export function providerInfo(provider: string | null, t: Messages): { name: stri
   return PROVIDERS[provider] ?? { name: provider, mark: provider.slice(0, 1).toUpperCase(), tone: 'ink' };
 }
 
+// Who speaks has a face: one picture per application, and one for the operator
+// (ui/public/avatars: the operator's own drawings, unchanged). Anything else
+// keeps its monogram.
+const AVATARS: Record<string, string> = { anthropic: 'claude', openai: 'codex', google: 'antigravity', xai: 'grok' };
+
 export function ProviderMark({ provider, size = 'md' }: { provider: string | null; size?: 'sm' | 'md' }) {
   const { t } = useI18n();
   const info = providerInfo(provider, t);
+  const avatar = provider === null ? 'operator' : AVATARS[provider];
+  if (avatar !== undefined) {
+    return <img className={`mark mark-${size} mark-avatar`} src={`/avatars/${avatar}.png`} alt="" aria-hidden="true" loading="lazy" draggable={false} />;
+  }
   return (
     <span className={`mark mark-${size}`} aria-hidden="true">
       {info.mark}

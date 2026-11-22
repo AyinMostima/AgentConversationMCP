@@ -297,9 +297,13 @@ private:
         const bool is_asset = !segments.empty() && std::filesystem::is_regular_file(target, error);
         const auto file = (is_asset ? target : root / "index.html").u8string();
         auto response = drogon::HttpResponse::newFileResponse(std::string(file.begin(), file.end()));
-        // Hashed assets may be cached; the entry document must always be revalidated.
-        response->addHeader("Cache-Control", is_asset && segments.front() == "assets" ? "public, max-age=31536000, immutable"
-                                                                                      : "no-cache");
+        // Hashed assets may be cached; the entry document must always be revalidated. The
+        // avatars are full-size pictures that every row of a timeline shows: kept for a day.
+        const bool hashed = is_asset && segments.front() == "assets";
+        const bool avatar = is_asset && segments.front() == "avatars";
+        response->addHeader("Cache-Control", hashed ? "public, max-age=31536000, immutable"
+                                             : avatar ? "public, max-age=86400"
+                                                      : "no-cache");
         return response;
     }
 

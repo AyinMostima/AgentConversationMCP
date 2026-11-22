@@ -319,9 +319,9 @@ When an idle window has no active in-process watcher, `src\mcp\dispatch.mjs` wak
 - **Codex**: Turns run inside the Codex desktop app for full visibility. First, `codex queue --thread <id>` enqueues the message so any open thread picks it up within seconds. If no hook or tool activity appears within 20 seconds, the service opens `codex://threads/<id>` (spaced 10 seconds apart across concurrent wakes) to bring the thread to the foreground and trigger queued delivery. Set `ACM_CODEX_CLI=on` to enable `codex exec resume` as an extra headless fallback. If Codex reports `no rollout found` for a deleted or ephemeral thread, the dispatcher automatically starts a per-window CLI stand-in via `codex exec` in that window's directory and resumes it on subsequent wakes.
 - **Antigravity**: Because the Antigravity CLI (`agy`) isolates its sessions from desktop conversations, idle desktop windows wake through a dedicated per-window **stand-in** conversation started in the window's working directory and reused on subsequent wakes. The stand-in receives explicit stand-in instructions plus temporary permission to invoke `acm` tools without prompts; the desktop window also receives the message on its next user prompt.
 - **Targeted stand-in policy**: Stand-ins launch strictly for messages naming the window in `to_windows` or targeting the session directly, running one stand-in at a time.
-- **Failure recovery**: Turns that exit with errors or are interrupted by a service restart are logged as failed deliveries in **Route Status** and retried after 5 minutes (up to 3 attempts). Turns cut off mid-flight without reporting a stop event automatically return to `idle` after the turn timeout so pending urgent work can wake the window again.
-- **Quota exhaustion protection**: When a client command or Codex session log reports vendor quota exhaustion (`usage_limit_exceeded`, `RESOURCE_EXHAUSTED`, or similar), the dispatcher pauses idle wake attempts for that client until the vendor-specified reset time, annotates its session with `out_of_quota` in `check_in` rosters so coordinators route work elsewhere, displays **Out of quota** under **Settings > Route Status**, and logs a deduplicated system alert.
-- **Operational note**: Because `agy` connects all configured MCP servers before starting a turn, slow external MCP servers can lengthen stand-in startup. Disable idle wake per session via **Allow urgent interrupts** or globally via `ACM_DISPATCH_COMMANDS={"antigravity":null}`.
+- **Failure recovery**: Turns that exit with errors or are interrupted by a service restart are logged as failed deliveries in **Route Status** and retried after 5 minutes (up to 3 attempts). Non-stand-in CLI turns signal `/api/v1/delivery/ended` on exit to return the window to `idle` immediately, and turns cut off mid-flight without reporting a stop event automatically return to `idle` after the turn timeout.
+- **Quota exhaustion protection**: When a client command or Codex session log reports vendor quota exhaustion (`usage_limit_exceeded`, `RESOURCE_EXHAUSTED`, or similar), the dispatcher pauses idle wake attempts for that client until the vendor-specified reset time, refuses targeted messages directed exclusively to that client with `CLIENT_OUT_OF_QUOTA`, annotates its session with `out_of_quota` in `check_in` rosters, displays **Out of quota** in **Overview > Client quota** and **Settings > Route Status**, and logs a deduplicated system alert.
+- **Proxy forwarding & operational notes**: Dispatched vendor CLIs automatically inherit active environment or Windows system proxy settings (preserving `NO_PROXY` for loopback) so headless turns can reach cloud endpoints even when the hub launched from a proxy-free client. Because `agy` connects all configured MCP servers before starting a turn, slow external MCP servers can lengthen stand-in startup. Disable idle wake per session via **Allow urgent interrupts** or globally via `ACM_DISPATCH_COMMANDS={"antigravity":null}`.
 
 ![Delivery Routes](docs/images/delivery-routes.png)
 
@@ -491,7 +491,7 @@ Run the automated test suites:
 ctest --preset windows-dev      # C++23 control core (106 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
 npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, alerts, wake, remote, tidy (76 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, alerts, wake, remote, tidy (77 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```
@@ -537,6 +537,7 @@ Desktop clients terminate child processes spawned under their MCP process tree. 
 - `OPEN_MODE_OFF`: Re-enable **Default Interconnection** or add both sessions to a task conversation.
 - `ALREADY_CLAIMED`: Another session holds the task; wait for release or reassign on the **Task Board**.
 - `RATE_LIMITED`: Wait `retry_after_seconds` or raise limits in **Settings > Rate & Flood Limits**.
+- `CLIENT_OUT_OF_QUOTA`: Every targeted recipient belongs to a client whose vendor quota is exhausted until the reported `until` timestamp; route the task to another active session.
 - `NO_BOT_HOST`: Run `cli.mjs --client grok listen` at least once so a session registers as bot host.
 - `ACTION_NOT_ALLOWED`: Bot deletion is unsupported by `bot_request`.
 - `CONVERSATION_ARCHIVED`: Restore the thread from the **Archived** section in the sidebar.

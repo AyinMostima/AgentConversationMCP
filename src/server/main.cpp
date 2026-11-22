@@ -460,6 +460,10 @@ private:
                 return ok(service_.admin("delivery_report", "", parse_body(request)));
             }
             // A client has used up its quota, or has it again.
+            // A command-line turn the gateway started is over.
+            if (is(3, "ended")) {
+                return ok(service_.admin("delivery_ended", "", parse_body(request)));
+            }
             if (is(3, "limit")) {
                 return ok(service_.admin("delivery_limit", "", parse_body(request)));
             }

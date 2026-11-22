@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import { freePort, repoRoot, startService } from '../support/service.mjs';
-import { codexQuota, dispatchRoutes, retryTime } from '../../src/mcp/dispatch.mjs';
+import { codexQuota, dispatchRoutes, proxyEnv, retryTime } from '../../src/mcp/dispatch.mjs';
 
 const runId = randomBytes(4).toString('hex');
 const base = mkdtempSync(join(tmpdir(), `acm-dispatch-${runId}-`));
@@ -176,6 +176,9 @@ describe('idle dispatch through the clients\' command lines', { concurrency: fal
     const cliWindow = own.command({ ...job, client_session: 'aaaaaaaa-1111-2222-3333-444444444444' }, {});
     assert.deepEqual(cliWindow.args.slice(0, 2), ['--conversation', 'aaaaaaaa-1111-2222-3333-444444444444']);
     assert.equal(cliWindow.args.at(-1), 'do it');
+    // It may call the acm tools without anyone confirming them, as the stand-in may.
+    const cliAllowed = own.command({ ...job, client_session: 'aaaaaaaa-1111-2222-3333-444444444444' }, {}, 'C:\data\stand-in-settings.json');
+    assert.deepEqual(cliAllowed.args.slice(2, 4), ['--settings', 'C:\data\stand-in-settings.json']);
     // None of it without the command lines, and none in a test run.
     assert.deepEqual(dispatchRoutes({ USERPROFILE: join(base, 'nobody'), APPDATA: join(base, 'nobody'), LOCALAPPDATA: join(base, 'nobody') }), {});
     assert.deepEqual(dispatchRoutes({ USERPROFILE: home, APPDATA: join(home, 'AppData', 'Roaming'), LOCALAPPDATA: join(home, 'AppData', 'Local'), ACM_DISPATCH_BUILTIN: 'off' }), {});
@@ -202,6 +205,10 @@ ${turn('2026-11-22T04:00:41Z', limit)}
     assert.equal(codexQuota(home, new Date('2026-12-01T00:00:00Z')), undefined);
     assert.equal(retryTime('quota exceeded', now).toISOString(), '2026-11-22T13:00:00.000Z');
     assert.equal(codexQuota(join(base, 'nobody'), now), undefined);
+    // The command lines get the user's proxy: from the environment, else from the system setting.
+    assert.deepEqual(proxyEnv({ HTTPS_PROXY: 'http://10.0.0.1:8080' }, () => undefined), { HTTPS_PROXY: 'http://10.0.0.1:8080', HTTP_PROXY: 'http://10.0.0.1:8080', NO_PROXY: 'localhost,127.0.0.1,::1' });
+    assert.equal(proxyEnv({ HTTPS_PROXY: '  ' }, () => '127.0.0.1:8888').HTTPS_PROXY, 'http://127.0.0.1:8888');
+    assert.deepEqual(proxyEnv({}, () => undefined), {});
   });
 
   it('falls back to the next command, and wakes Antigravity through a stand-in when its window is named', async () => {
@@ -298,5 +305,27 @@ ${turn('2026-11-22T04:00:41Z', limit)}
     assert.match((await status()).last_urgent.detail, /fresh-stand-in\.mjs/);
     // The new conversation is remembered for that window, so the next wake continues it.
     await waitFor(() => Object.values(JSON.parse(readFileSync(join(dataDir, 'stand-ins.json'), 'utf8'))).includes('0199bbbb-1111-2222-3333-555555555555'), 10000, 'the new conversation to be remembered');
+  });
+  it('sends nothing to an application that has used up its quota, and says so', async () => {
+    const until = new Date(Date.now() + 3600_000).toISOString();
+    await service.admin('POST', '/api/v1/delivery/limit', { client: 'codex', until, detail: 'You’ve hit your usage limit.' });
+    try {
+      // Every session sees it in the roster.
+      const roster = (await cli('claude', 'call', 'check_in')).project_sessions;
+      assert.equal(roster.find((entry) => entry.session_id === sessions.codex).out_of_quota.until, until);
+      // A message for Codex alone is refused, with the time it can be used again.
+      const refused = await promisify(execFile)(process.execPath, [join(repoRoot, 'src', 'mcp', 'cli.mjs'), '--client', 'claude', ...instance, '--no-autostart', 'call', 'direct_message', '--json', JSON.stringify({ to_session_id: sessions.codex, body: 'codex: run the audit', idempotency_key: `k${++key}` })]).then(({ stdout }) => JSON.parse(stdout), (failure) => JSON.parse(failure.stdout));
+      assert.equal(refused.ok, false);
+      assert.equal(refused.error.code, 'CLIENT_OUT_OF_QUOTA');
+      assert.match(refused.error.message, new RegExp(until.slice(0, 16)));
+      // A message for everybody still reaches the others.
+      const everybody = await cli('claude', 'call', 'send_message', '--json', JSON.stringify({ conversation_id: lobby, body: 'everybody: status at noon', idempotency_key: `k${++key}` }));
+      assert.ok(everybody.sequence > 0);
+      // The console says it too.
+      assert.equal((await service.admin('GET', '/api/v1/bootstrap')).client_limits.codex.until, until);
+    } finally {
+      await service.admin('POST', '/api/v1/delivery/limit', { client: 'codex' });
+    }
+    assert.equal((await cli('claude', 'call', 'direct_message', '--json', JSON.stringify({ to_session_id: sessions.codex, body: 'codex: run the audit', idempotency_key: `k${++key}` }))).conversation_id !== undefined, true);
   });
 });

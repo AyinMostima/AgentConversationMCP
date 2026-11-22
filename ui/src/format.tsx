@@ -4,6 +4,14 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Reac
 import type { Conversation, ReceiptStatus, SessionStatus } from './api';
 import { useI18n, type Messages } from './i18n';
 
+/** Maps a provider identifier to its desktop client dispatcher name. */
+export const CLIENT_OF_PROVIDER: Record<string, string> = { openai: 'codex', google: 'antigravity', anthropic: 'claude' };
+
+/** Human-readable client label for quota and route diagnostics. */
+export function clientDisplayName(client: string): string {
+  return ({ codex: 'Codex', antigravity: 'Antigravity', claude: 'Claude' } as Record<string, string>)[client] ?? client;
+}
+
 /** Display title for a conversation, including lobby and direct threads. */
 export function conversationName(conversation: Conversation, t: Messages, detail: 'short' | 'full' = 'short'): string {
   if (conversation.kind === 'lobby') {

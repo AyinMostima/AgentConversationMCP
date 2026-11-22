@@ -403,6 +403,15 @@ json Delivery::hook(const Session& session, const json& args) {
     });
 }
 
+json Delivery::turn_ended(const json& args) {
+    const auto window_id = require_string(args, "window_id", 96);
+    const auto now = to_rfc3339(clock_());
+    // Only a window still marked as in a turn; one that reported anything since keeps it.
+    const auto changed = database_.execute(
+        "UPDATE windows SET event = 'stop', seen_at = ? WHERE window_id = ? AND event IN ('prompt', 'tool')", now, window_id);
+    return {{"window_id", window_id}, {"idle", changed > 0}};
+}
+
 json Delivery::limits() {
     const auto stored = text_setting(database_, "client_limits");
     json parsed = stored ? json::parse(*stored, nullptr, false) : json::object();

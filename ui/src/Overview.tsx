@@ -4,7 +4,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import type { Stats } from './api';
 import { useConsole } from './App';
-import { MoreButton, Segmented } from './format';
+import { CLIENT_OF_PROVIDER, MoreButton, Segmented, clientDisplayName, formatTime } from './format';
 import { useI18n, type Messages } from './i18n';
 
 type Range = '1' | '7' | '30';
@@ -226,8 +226,55 @@ function conversationLabel(entry: Stats['conversations'][number], t: Messages): 
   return entry.title !== '' ? entry.title : entry.task_code;
 }
 
+/** Current vendor quota status for active desktop client sessions. */
+function QuotaCard() {
+  const { data } = useConsole();
+  const { t } = useI18n();
+  const [open, setOpen] = useState<string | null>(null);
+  const limits = data.client_limits ?? {};
+  const rows = data.sessions
+    .filter((session) => session.status === 'active')
+    .map((session) => {
+      const agent = data.agents.find((entry) => entry.agent_id === session.agent_id);
+      const client = CLIENT_OF_PROVIDER[agent?.provider ?? ''];
+      return { id: session.session_id, name: `${agent?.display_name ?? session.label} · ${session.label}`, client, limit: client === undefined ? undefined : limits[client] };
+    })
+    .filter((row) => row.client !== undefined);
+  if (rows.length === 0) {
+    return null;
+  }
+  return (
+    <section className="viz-card viz-wide quota-card">
+      <header className="viz-head">
+        <div>
+          <h2>{t.overview.quota}</h2>
+          <p className="muted small">{t.overview.quotaHint}</p>
+        </div>
+      </header>
+      <ul className="quota-list">
+        {rows.map((row) => (
+          <li key={row.id} className={row.limit === undefined ? '' : 'is-out'}>
+            <div className="quota-row">
+              <span className="quota-name">{row.name}</span>
+              {row.limit === undefined ? (
+                <span className="state state-done">{t.overview.quotaOk}</span>
+              ) : (
+                <>
+                  <span className="state state-blocked">{t.overview.quotaOut(formatTime(row.limit.until, t.dateLocale))}</span>
+                  <MoreButton open={open === row.id} onToggle={() => setOpen(open === row.id ? null : row.id)} label={t.overview.quotaDetail} />
+                </>
+              )}
+            </div>
+            {row.limit !== undefined && open === row.id && <p className="quota-detail muted small">{t.overview.quotaHeld(row.limit.detail)}</p>}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export function OverviewView() {
-  const { api, events } = useConsole();
+  const { api, events, data } = useConsole();
   const { t } = useI18n();
   const [range, setRange] = useState<Range>('7');
   const [stats, setStats] = useState<Stats | null>(null);
@@ -243,6 +290,7 @@ export function OverviewView() {
   }, [api, range, stamp]);
 
   const handed = stats === null ? 0 : stats.deliveries.ok + stats.deliveries.failed;
+  const out = Object.entries(data.client_limits ?? {});
   return (
     <main className="page sheet">
       <div className="page-inner viz">
@@ -263,6 +311,13 @@ export function OverviewView() {
             ]}
           />
         </header>
+        {out.length > 0 && (
+          <div className="quota-alert" role="alert">
+            {out.map(([client, mark]) => (
+              <p key={client}>{t.overview.quotaAlert(clientDisplayName(client), formatTime(mark.until, t.dateLocale))}</p>
+            ))}
+          </div>
+        )}
         {stats === null ? (
           <p className="muted">{t.overview.loading}</p>
         ) : (
@@ -273,6 +328,7 @@ export function OverviewView() {
               <Tile label={t.overview.activeWindows} value={String(stats.active_windows)} />
               <Tile label={t.overview.handedOver} value={handed === 0 ? '—' : `${Math.round((stats.deliveries.ok / handed) * 100)}%`} note={handed === 0 ? t.overview.handedOverNone : `${stats.deliveries.ok} / ${handed}`} />
             </div>
+            <QuotaCard />
             <TimeChart stats={stats} />
             <div className="viz-grid">
               <section className="viz-card">

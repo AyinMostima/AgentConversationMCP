@@ -117,6 +117,11 @@ public:
     // The limit of one client, or null.
     json limit_of(std::string_view client);
 
+    // Gateway: a turn it started in a window's own conversation from the command line
+    // is over ({window_id}). Such a turn does not always report its end through the
+    // hooks; without this the window would count as busy for Windows::kTurnSeconds.
+    json turn_ended(const json& args);
+
 private:
     struct Pending {
         std::int64_t rowid;

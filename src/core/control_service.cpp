@@ -130,6 +130,7 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
                      {{"window", target.name}});
             }
         }
+        refuse_out_of_quota({peer}, targets);
         const json conversation = conversations_.direct(session, peer);
         json draft = args;
         draft.erase("to_session_id");
@@ -168,7 +169,11 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
         return conversations_.propose(session, args);
     }
     if (tool == "send_message") {
-        return messages_.send(session, args, window, target_windows(session, args));
+        std::vector<Window> targets = target_windows(session, args);
+        refuse_out_of_quota(args.contains("recipient_session_ids") ? optional_string_list(args, "recipient_session_ids")
+                                                                    : std::vector<std::string>(),
+                            targets);
+        return messages_.send(session, args, window, std::move(targets));
     }
     if (tool == "get_inbox") {
         return messages_.inbox(session, args);
@@ -465,6 +470,9 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     if (operation == "delivery_report") {
         return delivery_.report(args);
     }
+    if (operation == "delivery_ended") {
+        return delivery_.turn_ended(args);
+    }
     if (operation == "delivery_limit") {
         return json{{"client_limits", delivery_.set_limit(args)}};
     }
@@ -528,6 +536,10 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         if (const auto handles = optional_string_list(with_target, "to_windows"); !handles.empty()) {
             targets = windows_.lookup(conversations_.get(target_id).at("project_id").get<std::string>(), handles);
         }
+        refuse_out_of_quota(with_target.contains("recipient_session_ids")
+                                ? optional_string_list(with_target, "recipient_session_ids")
+                                : std::vector<std::string>(),
+                            targets);
         return messages_.send_as_operator(with_target, std::move(targets));
     }
     if (operation == "set_goal") {
@@ -723,6 +735,52 @@ json ControlService::compact(const Session* session, const json& args, const std
         result["open_tasks"] = board_.tasks(conversation_id, false).size();
     }
     return result;
+}
+
+json ControlService::quota_of_session(std::string_view session_id, const json& active_limits) {
+    Statement clients = database_.query("SELECT DISTINCT client FROM windows WHERE session_id = ? AND client <> ''", session_id);
+    while (clients.step()) {
+        const std::string client = clients.text(0);
+        if (active_limits.contains(client)) {
+            json limit = active_limits.at(client);
+            limit["client"] = client;
+            return limit;
+        }
+    }
+    return nullptr;
+}
+
+void ControlService::refuse_out_of_quota(const std::vector<std::string>& sessions, const std::vector<Window>& targets) {
+    std::vector<std::string> named = sessions;
+    if (!targets.empty()) {
+        named.clear();
+        for (const auto& target : targets) {
+            named.push_back(target.session_id);
+        }
+    }
+    if (named.empty()) {
+        return;
+    }
+    const json active_limits = delivery_.limits();
+    if (active_limits.empty()) {
+        return;
+    }
+    json first;
+    for (const auto& id : named) {
+        json limit = quota_of_session(id, active_limits);
+        if (limit.is_null()) {
+            return;
+        }
+        if (first.is_null()) {
+            first = std::move(limit);
+            first["session_id"] = id;
+        }
+    }
+    fail("CLIENT_OUT_OF_QUOTA",
+         std::format("{} quota is exhausted until {}; targeted messages are paused until reset. Route this work to "
+                     "another active session (see out_of_quota in project_sessions).",
+                     first.value("client", std::string("target client")), first.value("until", std::string())),
+         first);
 }
 
 json ControlService::roster(const Session& session, const Window* window, bool all_windows) {

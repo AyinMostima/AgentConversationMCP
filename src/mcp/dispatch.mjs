@@ -154,7 +154,9 @@ export function dispatchRoutes(env = process.env) {
         {
           name: 'agy (the conversation itself)',
           long: true,
-          command: (job) => (stored(job.client_session) ? { file: agy, args: print(job.client_session, job.text) } : undefined),
+          // Nobody confirms its tool calls either: without the acm tools allowed, agy's safety check
+          // stops the call that reads the request or reports back ("unsupported_tool: call_mcp_tool").
+          command: (job, memory, settingsFile) => (stored(job.client_session) ? { file: agy, args: print(job.client_session, job.text, settingsFile === undefined ? [] : ['--settings', settingsFile]) } : undefined),
         },
         {
           name: 'agy (stand-in)',
@@ -281,6 +283,54 @@ export function codexQuota(home = homedir(), now = new Date()) {
  * when it ends with an error within `graceMs`, handed over otherwise; it then
  * keeps running, and `ended({code, output})` is called when it is over.
  */
+/**
+ * The proxy a vendor's command line needs to reach its service, as variables. The
+ * service itself may have been started without them (by a client that had none in
+ * its environment); agy then cannot log in or list its models ("plan model not
+ * specified"). Taken from the environment when set there, otherwise from the
+ * Windows proxy setting of the user. Empty when there is none.
+ */
+export function proxyEnv(env = process.env, readSystem = systemProxy) {
+  const given = [env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy].find((value) => typeof value === 'string' && value.trim() !== '');
+  const raw = (given ?? readSystem() ?? '').trim();
+  if (raw === '') {
+    return {};
+  }
+  const url = /^[a-z]+:\/\//i.test(raw) ? raw : `http://${raw}`;
+  const noProxy = [env.NO_PROXY, env.no_proxy].find((value) => typeof value === 'string' && value.trim() !== '');
+  return { HTTPS_PROXY: url, HTTP_PROXY: url, NO_PROXY: noProxy ?? 'localhost,127.0.0.1,::1' };
+}
+
+function systemProxy() {
+  if (process.platform !== 'win32') {
+    return undefined;
+  }
+  try {
+    const key = String.raw`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`;
+    const read = (name) => spawnSync('reg', ['query', key, '/v', name], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).stdout ?? '';
+    if (!/ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(read('ProxyEnable'))) {
+      return undefined;
+    }
+    const [, server] = /ProxyServer\s+REG_SZ\s+(\S+)/i.exec(read('ProxyServer')) ?? [];
+    // "http=host:port;https=host:port" or one "host:port" for all.
+    const [, https] = /(?:^|;)https=([^;]+)/i.exec(server ?? '') ?? [];
+    return https ?? (server !== undefined && !server.includes('=') ? server : undefined);
+  } catch {
+    return undefined;
+  }
+}
+
+let commandProxy = {};
+let commandProxyAt = 0;
+function currentCommandProxy() {
+  const now = Date.now();
+  if (now - commandProxyAt > 60_000) {
+    commandProxy = proxyEnv();
+    commandProxyAt = now;
+  }
+  return commandProxy;
+}
+
 function run({ file, args, env }, cwd, { long, graceMs, started, ended }) {
   return new Promise((done) => {
     let head = '';
@@ -293,7 +343,8 @@ function run({ file, args, env }, cwd, { long, graceMs, started, ended }) {
     try {
       child = spawn(file, args, {
         cwd: cwd !== null && cwd !== undefined && existsSync(cwd) ? cwd : undefined,
-        env: env === undefined ? process.env : { ...process.env, ...env },
+        // Forward active user proxy settings so dispatched vendor CLIs can reach their APIs.
+        env: { ...process.env, ...currentCommandProxy(), ...(env ?? {}) },
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -476,6 +527,12 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
             } else if (conversation !== undefined) {
               remember(job.window_id, conversation);
             }
+          }
+          // Mark the window idle immediately when a non-stand-in CLI turn ends.
+          if (route.long && !route.standIn) {
+            void local('/api/v1/delivery/ended', { window_id: job.window_id }).catch((error) => {
+              say(`failed to mark window ${job.window} idle: ${error.message}`);
+            });
           }
           // A turn that ended because the client's quota is used up: nothing more is started for that client.
           if (failure !== undefined) {

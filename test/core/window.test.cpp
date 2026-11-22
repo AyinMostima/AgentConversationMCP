@@ -406,7 +406,15 @@ TEST_CASE("a window whose turn was cut off can be woken again, unless its client
     f.say(f.claude, &lead, "cut: pick it up again", true, {cut});
     // In a turn a short while ago: it is busy, nothing is started for it.
     REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
-    // Long after, it is idle as the roster says, and is started.
+    // A command-line turn the gateway ran for it is over: idle at once, not only after kTurnSeconds.
+    REQUIRE(f.delivery.turn_ended({{"window_id", cut.window_id}}).at("idle") == true);
+    REQUIRE(f.delivery.turn_ended({{"window_id", cut.window_id}}).at("idle") == false);
+    f.pass(acm::Delivery::kSettleSeconds + 1);
+    {
+        const json now = f.delivery.claim({{"clients", {"codex"}}}).at("jobs");
+        REQUIRE(now.size() == 1);
+        f.delivery.report({{"delivery_id", now.at(0).at("delivery_id")}, {"ok", false}, {"postponed", true}});
+    }
     f.pass(acm::Windows::kTurnSeconds);
     // Unless its client has used up its quota: then nothing is started for it until the vendor's time.
     const std::string until = acm::to_rfc3339(f.time.clock()() + std::chrono::hours(2));

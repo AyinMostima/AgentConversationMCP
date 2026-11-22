@@ -61,6 +61,11 @@ private:
     json check_in(const Session& session, const json& args, const Window* window);
     // The sessions a caller can address, each with its windows.
     json roster(const Session& session, const Window* window, bool all_windows = false);
+    // The quota mark of the application session `session_id` runs in, or null.
+    json quota_of_session(std::string_view session_id, const json& active_limits);
+    // Rejects targeted messages with CLIENT_OUT_OF_QUOTA when every explicitly named
+    // session or window belongs to an application whose quota is exhausted.
+    void refuse_out_of_quota(const std::vector<std::string>& sessions, const std::vector<Window>& targets);
     // Compacting a conversation: its messages (Conversations::compact) and its board (close_tasks).
     json compact(const Session* session, const json& args, const std::string& by);
     // Activity of the last `days` days for the console's overview: messages per

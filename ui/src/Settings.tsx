@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import type { ClientHook } from './api';
 import { useConsole } from './App';
-import { ActionButton, CopyButton, Icon, MoreButton, Pill, Segmented, SubmitButton, Switch, formatTime, useBusy } from './format';
+import { ActionButton, CLIENT_OF_PROVIDER, CopyButton, Icon, MoreButton, Pill, Segmented, SubmitButton, Switch, formatTime, useBusy } from './format';
 import { useI18n, type LanguagePref, type Messages } from './i18n';
 
 /** Console language selector: Auto (browser locale), English, or Simplified Chinese. */
@@ -269,9 +269,6 @@ function idleRoute(provider: string, hook: ClientHook, dispatchClients: string[]
 }
 
 /** Diagnostic view of all active ingress/egress routes and hook states. */
-/** Which client application a provider's desktop sessions run in, as the dispatcher names it. */
-const CLIENT_OF_PROVIDER: Record<string, string> = { openai: 'codex', google: 'antigravity', anthropic: 'claude' };
-
 function Routes() {
   const { api, data, run } = useConsole();
   const { t } = useI18n();

@@ -261,6 +261,13 @@ select {
 .brand-tile { fill: #131b2f; }
 .brand-tagline { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
+.identity-list { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+.identity-row { display: flex; align-items: center; gap: 12px; min-height: 64px; padding: 6px 0; border-top: 1px solid var(--rule-subtle); }
+.identity-face { flex: none; padding: 0; border: 0; border-radius: 9999px; background: none; cursor: pointer; transition: transform 160ms var(--ease), box-shadow 160ms var(--ease); }
+.identity-face:hover { transform: scale(1.06); box-shadow: 0 0 0 3px var(--fill-strong); }
+.identity-face:active { transform: scale(0.97); }
+.identity-name { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
+.identity-name input { flex: 1; min-width: 0; max-width: 260px; min-height: 30px; padding: 0 10px; }
 .context-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 8px; border-top: 1px solid var(--rule-subtle); }
 .btn-small { min-height: 26px; padding: 0 10px; font-size: 12px; }
 .digest-text { max-height: 46vh; overflow-y: auto; padding: 10px 12px; border-radius: 10px; background: var(--fill); }

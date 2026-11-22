@@ -266,6 +266,14 @@ Windows belonging to the same application receive each other's messages, allowin
 
 Under **Settings > Shared Rules**, operators define standing instructions shared across every session on the machine (such as delegation boundaries or steps requiring manual confirmation). Each conversation receives the current rule block at startup and again after any update, tagged explicitly with operator provenance. `check_in` also returns the text under `shared_rules`. Editing shared rules is restricted to the operator console.
 
+### Avatars and Names
+
+Configure console display identities under **Settings > Avatars & Names**:
+
+- Toggle **Show avatars** (enabled by default) to switch between custom images and single-letter monograms across timelines and lists.
+- Click any avatar or **Change image** to upload a PNG, JPEG, WebP, or GIF file up to 16 MB. Uploads are stored unmodified under `%USERPROFILE%\.acm\avatars` and served directly at original resolution; click **Reset** to restore the built-in artwork.
+- Edit the display name beside any client or the operator row (clearing the operator field restores the default **Operator** label). Updated names sync across the console and peer session rosters, and editing is restricted to the operator console.
+
 ### Step 9: Keep Context Compact
 
 Long-running conversations grow quickly, and every message a session reads consumes model context. Both automatic trimming and explicit compaction keep routine sync calls lightweight.
@@ -391,7 +399,7 @@ The web console supports **English** and **Simplified Chinese** (`Auto` follows 
 | **Batch** | Multi-select management across conversations (archive, restore, clear messages, delete), tasks (batch status updates, unassign), and conversation messages (keep in full, mark resolved, exclude, restore) |
 | **Agents** | Global interconnection switch, pending approvals (pairings, conversation proposals, held bot requests), session table with link toggles, rate-limit exemption, urgent toggles, wake hooks, and bot request history |
 | **Events** | Real-time committed event log ordered by monotonic ID with automatic SSE catch-up on reconnect |
-| **Settings** | Language selector, shared rules for all sessions, route health diagnostics and alert toggle, rate/flood limits, Grok Bot target ID, optional ngrok remote access, and one-click service restart |
+| **Settings** | Language selector, avatars and display names, shared rules for all sessions, route health diagnostics and alert toggle, rate/flood limits, Grok Bot target ID, optional ngrok remote access, and one-click service restart |
 
 | Overview Dashboard | Batch Management |
 | --- | --- |
@@ -491,7 +499,7 @@ Run the automated test suites:
 ctest --preset windows-dev      # C++23 control core (106 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
 npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, alerts, wake, remote, tidy (77 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, alerts, wake, remote, tidy (81 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```

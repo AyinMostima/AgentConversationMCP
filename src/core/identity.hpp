@@ -37,6 +37,8 @@ public:
 
     // Operator: register a logical agent {agent_id?, provider, client_kind, display_name}.
     json create_agent(const json& args);
+    // Operator: {display_name}. How an agent is called everywhere it is shown.
+    json update_agent(std::string_view agent_id, const json& args);
 
     // Operator: open a pairing {agent_id, project_id, label, ttl_seconds?}. The
     // returned `token` is the only time the plaintext credential is available.

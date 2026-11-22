@@ -7,7 +7,7 @@ import { EventsView } from './Events';
 import { ManageView } from './Manage';
 import { OverviewView } from './Overview';
 import { SettingsView } from './Settings';
-import { ActionButton, Icon, Pill } from './format';
+import { ActionButton, AvatarContext, Icon, Pill } from './format';
 import { useI18n, type Messages } from './i18n';
 import { WorkspaceView } from './Workspace';
 
@@ -188,6 +188,11 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
   tRef.current = t;
   const api = useMemo(() => createApi(token), [token]);
   const [data, setData] = useState<Bootstrap | null>(null);
+  const { setOperatorName } = useI18n();
+  const operatorName = data?.settings.operator_name ?? '';
+  useEffect(() => {
+    setOperatorName(operatorName);
+  }, [operatorName, setOperatorName]);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [connection, setConnection] = useState<Connection>('connecting');
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -325,6 +330,7 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
     data.proposals.filter((proposal) => proposal.status === 'pending').length +
     data.bot_requests.filter((entry) => entry.status === 'held').length;
   const state: ConsoleState = { api, data, events, connection, refresh, notify, run, requestRestart: () => setConfirmRestart(true) };
+  const avatars = { enabled: data.settings.avatars_enabled, custom: data.avatars ?? {} };
   const tabs: { id: View; label: string; icon: string; badge?: number }[] = [
     { id: 'workspace', label: t.nav.workspace, icon: 'chat' },
     { id: 'overview', label: t.nav.overview, icon: 'chart' },
@@ -338,6 +344,7 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
 
   return (
     <ConsoleContext.Provider value={state}>
+      <AvatarContext.Provider value={avatars}>
       <div className="app">
         <header className="topbar">
           <Brand />
@@ -406,6 +413,7 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
           ))}
         </div>
       </div>
+      </AvatarContext.Provider>
     </ConsoleContext.Provider>
   );
 }

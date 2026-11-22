@@ -1,9 +1,9 @@
 // Settings view: interface language, route diagnostics, rate limits, Grok Bot
 // prefill target, optional ngrok remote access, and service restart control.
-import { useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import type { ClientHook } from './api';
 import { useConsole } from './App';
-import { ActionButton, CLIENT_OF_PROVIDER, CopyButton, Icon, MoreButton, Pill, Segmented, SubmitButton, Switch, formatTime, useBusy } from './format';
+import { ActionButton, AvatarContext, CLIENT_OF_PROVIDER, CopyButton, Icon, MoreButton, Pill, ProviderMark, Segmented, SubmitButton, Switch, avatarSlot, formatTime, useBusy } from './format';
 import { useI18n, type LanguagePref, type Messages } from './i18n';
 
 /** Console language selector: Auto (browser locale), English, or Simplified Chinese. */
@@ -28,6 +28,88 @@ function LanguageSetting() {
           { id: 'zh-CN', label: t.settings.langZh },
         ]}
       />
+    </section>
+  );
+}
+
+/** One face and one name: an application, or the operator. Both can be changed; the built-in face comes back on request. */
+function IdentityRow({ provider, name, fallback, onRename }: { provider: string | null; name: string; fallback: string; onRename: (name: string) => Promise<unknown> }) {
+  const { api, run } = useConsole();
+  const { t } = useI18n();
+  const avatars = useContext(AvatarContext);
+  const slot = avatarSlot(provider);
+  const picker = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState(name);
+  useEffect(() => {
+    setDraft(name);
+  }, [name]);
+  const [busy, track] = useBusy();
+  const custom = avatars.custom[slot] !== undefined;
+  return (
+    <li className="identity-row">
+      <button type="button" className="identity-face" title={t.settings.avatarChange} aria-label={t.settings.avatarChangeAria(name === '' ? fallback : name)} onClick={() => picker.current?.click()}>
+        <ProviderMark provider={provider} />
+      </button>
+      <input
+        ref={picker}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        hidden
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = '';
+          if (file !== undefined) {
+            void run(() => api.uploadAvatar(slot, file), t.settings.avatarChanged);
+          }
+        }}
+      />
+      <form
+        className="identity-name"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void track(onRename(draft.trim()));
+        }}
+      >
+        <input value={draft} maxLength={40} placeholder={fallback} aria-label={t.settings.nameAria(fallback)} spellCheck={false} onChange={(event) => setDraft(event.target.value)} />
+        {draft.trim() !== name && <SubmitButton busy={busy} disabled={provider !== null && draft.trim() === ''}>{t.common.save}</SubmitButton>}
+      </form>
+      <button type="button" className="btn btn-quiet btn-small" onClick={() => picker.current?.click()}>{t.settings.avatarChange}</button>
+      {custom && <ActionButton className="btn btn-quiet btn-small" onAction={() => run(() => api.removeAvatar(slot), t.settings.avatarRestored)}>{t.settings.avatarRestore}</ActionButton>}
+    </li>
+  );
+}
+
+/** Faces and names in the console: a switch for the faces, and each of them to change. */
+function Identities() {
+  const { api, data, run } = useConsole();
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const replaced = Object.keys(data.avatars ?? {}).length;
+  // One row per provider: its agents share a face.
+  const seen = new Set<string>();
+  const agents = data.agents.filter((agent) => !seen.has(agent.provider) && seen.add(agent.provider));
+  return (
+    <section className="setting setting-stack">
+      <div className="setting-row">
+        <Icon name="agents" size={18} />
+        <div>
+          <strong>{t.settings.identitiesTitle}</strong>
+          <p>{data.settings.avatars_enabled ? t.settings.identitiesOn(replaced) : t.settings.identitiesOff}</p>
+        </div>
+        <MoreButton open={open} onToggle={() => setOpen((value) => !value)} label={t.settings.identitiesEditAria} />
+        <Switch checked={data.settings.avatars_enabled} label={t.settings.identitiesSwitch} onChange={(enabled) => run(() => api.setAvatarsEnabled(enabled), enabled ? t.settings.avatarsShown : t.settings.avatarsHidden)} />
+      </div>
+      {open && (
+        <div className="hook-form">
+          <p className="muted small">{t.settings.identitiesIntro}</p>
+          <ul className="identity-list">
+            <IdentityRow key="operator" provider={null} name={data.settings.operator_name} fallback={t.settings.operatorDefault} onRename={(name) => run(() => api.setOperatorName(name), t.settings.nameSaved)} />
+            {agents.map((agent) => (
+              <IdentityRow key={agent.agent_id} provider={agent.provider} name={agent.display_name} fallback={agent.display_name} onRename={(name) => run(() => api.renameAgent(agent.agent_id, name), t.settings.nameSaved)} />
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   );
 }
@@ -489,6 +571,7 @@ export function SettingsView() {
         </header>
         <div className="settings-list">
           <LanguageSetting />
+          <Identities />
           <SharedRules />
           <Routes />
           <FloodControl />

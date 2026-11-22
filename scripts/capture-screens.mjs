@@ -388,6 +388,22 @@ await shot('flow-digest-panel', 'light', desktop, async (page) => {
   await page.getByRole('button', { name: 'Write digest' }).click();
   await page.getByPlaceholder(/Summarize decisions/).waitFor({ timeout: 3000 });
 });
+await shot('flow-identities', 'light', desktop, async (page) => {
+  // Avatars and names: verify default avatars, toggle off to monograms, and restore.
+  await toSettings(page);
+  await page.getByRole('button', { name: 'Edit avatars and names' }).click();
+  await page.getByRole('button', { name: 'Change image' }).first().waitFor({ timeout: 3000 });
+  if ((await page.locator('.identity-row .mark-avatar').count()) < 4) {
+    throw new Error('each application and the operator should show an avatar');
+  }
+  await page.getByRole('switch', { name: 'Show avatars' }).click();
+  await page.locator('.identity-row .mark:not(.mark-avatar)').first().waitFor({ timeout: 3000 });
+  if ((await page.locator('.mark-avatar').count()) !== 0) {
+    throw new Error('switched off, no avatar should remain on the page');
+  }
+  await page.getByRole('switch', { name: 'Show avatars' }).click();
+  await page.locator('.identity-row .mark-avatar').first().waitFor({ timeout: 3000 });
+});
 await shot('flow-flood-limits', 'light', desktop, async (page) => {
   await toSettings(page);
   await page.getByRole('button', { name: 'Adjust limits' }).click();

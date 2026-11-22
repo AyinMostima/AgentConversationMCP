@@ -86,6 +86,24 @@ json Identity::create_agent(const json& args) {
     });
 }
 
+json Identity::update_agent(std::string_view agent_id, const json& args) {
+    const auto display_name = require_string(args, "display_name", 64);
+    return database_.transaction([&] {
+        Statement row = database_.query("SELECT provider, client_kind, created_at FROM agents WHERE agent_id = ?", agent_id);
+        if (!row.step()) {
+            fail("NOT_FOUND", std::format("agent {} does not exist", agent_id));
+        }
+        json agent = {{"agent_id", agent_id},
+                      {"provider", row.text(0)},
+                      {"client_kind", row.text(1)},
+                      {"display_name", display_name},
+                      {"created_at", row.text(2)}};
+        database_.execute("UPDATE agents SET display_name = ? WHERE agent_id = ?", display_name, agent_id);
+        events_.append("agent.updated", {}, agent_id, {{"agent_id", agent_id}, {"display_name", display_name}});
+        return agent;
+    });
+}
+
 json Identity::create_pairing(const json& args) {
     const auto agent_id = require_string(args, "agent_id", 96);
     const auto project_id = require_string(args, "project_id", 96);

@@ -61,6 +61,7 @@ private:
     json check_in(const Session& session, const json& args, const Window* window);
     // The sessions a caller can address, each with its windows.
     json roster(const Session& session, const Window* window, bool all_windows = false);
+    json custom_avatars();
     // The quota mark of the application session `session_id` runs in, or null.
     json quota_of_session(std::string_view session_id, const json& active_limits);
     // Rejects targeted messages with CLIENT_OUT_OF_QUOTA when every explicitly named

@@ -255,11 +255,13 @@ drogon::HttpResponsePtr event_stream_response(acm::ControlService& service, std:
 
 class Router {
 public:
-    Router(acm::ControlService& service, std::string admin_token, std::filesystem::path ui_dir, json service_info)
+    Router(acm::ControlService& service, std::string admin_token, std::filesystem::path ui_dir, json service_info,
+           std::filesystem::path data_dir)
         : service_(service),
           admin_token_(std::move(admin_token)),
           ui_dir_(std::move(ui_dir)),
-          service_info_(std::move(service_info)) {}
+          service_info_(std::move(service_info)),
+          avatar_dir_(std::move(data_dir) / "avatars") {}
 
     void handle(const drogon::HttpRequestPtr& request, Callback&& callback) {
         try {
@@ -277,6 +279,66 @@ public:
 
 private:
     drogon::HttpResponsePtr ok(const json& result) { return json_response(200, {{"ok", true}, {"result", result}}); }
+
+    // Which kind of picture these bytes are, by how they begin; empty when none we take.
+    static std::string picture_kind(std::string_view bytes) {
+        const auto starts = [&](std::string_view head) { return bytes.substr(0, head.size()) == head; };
+        if (starts("\x89PNG\r\n\x1a\n")) {
+            return "png";
+        }
+        if (starts("\xff\xd8\xff")) {
+            return "jpg";
+        }
+        if (starts("GIF87a") || starts("GIF89a")) {
+            return "gif";
+        }
+        if (bytes.size() > 12 && starts("RIFF") && bytes.substr(8, 4) == "WEBP") {
+            return "webp";
+        }
+        return {};
+    }
+
+    json store_avatar(const std::string& slot, std::string_view bytes) {
+        static constexpr std::size_t kLimit = 16 * 1024 * 1024;
+        const std::string kind = picture_kind(bytes);
+        if (kind.empty()) {
+            acm::fail("INVALID_ARGUMENT", "an avatar is a PNG, JPEG, GIF or WebP picture");
+        }
+        if (bytes.size() > kLimit) {
+            acm::fail("INVALID_ARGUMENT", "an avatar may be 16 MB at most");
+        }
+        // Checks the name of the slot before anything is written under it.
+        const json before = service_.admin("avatar", slot, json::object());
+        std::error_code error;
+        std::filesystem::create_directories(avatar_dir_, error);
+        if (before.at("custom").get<bool>()) {
+            std::filesystem::remove(avatar_dir_ / (slot + "." + before.at("kind").get<std::string>()), error);
+        }
+        const auto file = avatar_dir_ / (slot + "." + kind);
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        out.close();
+        if (!out) {
+            acm::fail("INTERNAL", "the picture could not be written to the data directory");
+        }
+        return service_.admin("set_avatar", slot, {{"kind", kind}});
+    }
+
+    drogon::HttpResponsePtr custom_avatar(const std::string& slot) {
+        const json known = service_.admin("avatar", slot, json::object());
+        if (!known.at("custom").get<bool>()) {
+            acm::fail("NOT_FOUND", "no such avatar");
+        }
+        const auto file = (avatar_dir_ / (slot + "." + known.at("kind").get<std::string>())).u8string();
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(std::filesystem::path(file), error)) {
+            acm::fail("NOT_FOUND", "no such avatar");
+        }
+        auto response = drogon::HttpResponse::newFileResponse(std::string(file.begin(), file.end()));
+        // Its address carries its version (?v=...), so a copy never goes stale.
+        response->addHeader("Cache-Control", "public, max-age=31536000, immutable");
+        return response;
+    }
 
     // Serves the built operator console. The files are public static assets; every
     // piece of data they show is fetched from /api/v1 with the operator credential.
@@ -343,6 +405,11 @@ private:
             require_admin(request);
             drogon::app().getLoop()->runAfter(0.2, [] { drogon::app().quit(); });
             return ok({{"stopping", true}});
+        }
+        // A picture the operator put in place of a built-in avatar. Public like the
+        // console's own files: it is shown by an <img>, which cannot carry a credential.
+        if (method == drogon::Get && path.size() == 3 && is(0, "avatars") && is(1, "custom")) {
+            return custom_avatar(path[2]);
         }
         if (method == drogon::Get && !is(0, "api") && !is(0, "internal")) {
             return console_file(path);
@@ -483,6 +550,21 @@ private:
         if (resource == "sessions" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("set_session", path[3], parse_body(request)));
         }
+        if (resource == "agents" && path.size() == 4 && method == drogon::Put) {
+            return ok(service_.admin("update_agent", path[3], parse_body(request)));
+        }
+        // The request body is the picture itself, as the browser read it from the file: unchanged.
+        if (resource == "avatars" && path.size() == 4 && method == drogon::Put) {
+            return ok(store_avatar(path[3], request->getBody()));
+        }
+        if (resource == "avatars" && path.size() == 4 && method == drogon::Delete) {
+            const json before = service_.admin("avatar", path[3], json::object());
+            if (before.at("custom").get<bool>()) {
+                std::error_code ignored;
+                std::filesystem::remove(avatar_dir_ / (path[3] + "." + before.at("kind").get<std::string>()), ignored);
+            }
+            return ok(service_.admin("remove_avatar", path[3], json::object()));
+        }
         if (resource == "windows" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("rename_window", path[3], parse_body(request)));
         }
@@ -538,6 +620,8 @@ private:
     std::string admin_token_;
     std::filesystem::path ui_dir_;
     json service_info_;
+    // Where the avatars the operator chose are kept: <data>/avatars/<slot>.<kind>.
+    std::filesystem::path avatar_dir_;
 };
 
 }  // namespace
@@ -547,7 +631,8 @@ int wmain(int argc, wchar_t** argv) {
         const Options options = parse_options(argc, argv);
         std::filesystem::create_directories(options.data_dir);
         acm::ControlService service(options.data_dir);
-        Router router(service, load_or_create_admin_token(options.data_dir), options.ui_dir, options.service_info);
+        Router router(service, load_or_create_admin_token(options.data_dir), options.ui_dir, options.service_info,
+                      options.data_dir);
 
         drogon::app().registerHandlerViaRegex(
             "/.*",
@@ -559,6 +644,9 @@ int wmain(int argc, wchar_t** argv) {
             .setLogLevel(trantor::Logger::kWarn)
             .setThreadNum(2)
             .setIdleConnectionTimeout(0)
+            // An avatar is uploaded as it is; nothing else the console sends is large.
+            .setClientMaxBodySize(20 * 1024 * 1024)
+            .setClientMaxMemoryBodySize(20 * 1024 * 1024)
             .addListener(options.host, options.port);
         std::printf("[OK] acm-core %s listening on http://%s:%u schema=%d\n", kVersion, options.host.c_str(),
                     static_cast<unsigned>(options.port), service.schema_version());

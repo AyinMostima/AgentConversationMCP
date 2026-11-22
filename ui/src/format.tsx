@@ -1,6 +1,6 @@
 // Presentation helpers: localized time and identifiers, provider marks, icons,
 // interactive controls, and a safe Markdown renderer.
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { Conversation, ReceiptStatus, SessionStatus } from './api';
 import { useI18n, type Messages } from './i18n';
 
@@ -73,16 +73,37 @@ export function providerInfo(provider: string | null, t: Messages): { name: stri
 }
 
 // Who speaks has a face: one picture per application, and one for the operator
-// (ui/public/avatars: the operator's own drawings, unchanged). Anything else
-// keeps its monogram.
-const AVATARS: Record<string, string> = { anthropic: 'claude', openai: 'codex', google: 'antigravity', xai: 'grok' };
+// (ui/public/avatars: the operator's own drawings, unchanged). The operator can
+// put another picture in the place of each, or switch faces off; anything
+// without a picture keeps its monogram.
+const AVATARS: Record<string, string> = { anthropic: 'claude', openai: 'codex', google: 'antigravity', xai: 'grok', operator: 'operator' };
+
+/** Whether faces are shown, and which of them the operator replaced (slot to version). */
+export interface AvatarState {
+  enabled: boolean;
+  custom: Record<string, string>;
+}
+export const AvatarContext = createContext<AvatarState>({ enabled: true, custom: {} });
+
+/** The slot a provider's face is kept under; the operator has one of its own. */
+export const avatarSlot = (provider: string | null): string => (provider === null ? 'operator' : provider);
+
+/** Where the face of a slot comes from, or undefined when it has none. */
+export function avatarSource(slot: string, state: AvatarState): string | undefined {
+  const version = state.custom[slot];
+  if (version !== undefined) {
+    return `/avatars/custom/${slot}?v=${encodeURIComponent(version)}`;
+  }
+  return AVATARS[slot] === undefined ? undefined : `/avatars/${AVATARS[slot]}.png`;
+}
 
 export function ProviderMark({ provider, size = 'md' }: { provider: string | null; size?: 'sm' | 'md' }) {
   const { t } = useI18n();
+  const avatars = useContext(AvatarContext);
   const info = providerInfo(provider, t);
-  const avatar = provider === null ? 'operator' : AVATARS[provider];
-  if (avatar !== undefined) {
-    return <img className={`mark mark-${size} mark-avatar`} src={`/avatars/${avatar}.png`} alt="" aria-hidden="true" loading="lazy" draggable={false} />;
+  const source = avatars.enabled ? avatarSource(avatarSlot(provider), avatars) : undefined;
+  if (source !== undefined) {
+    return <img className={`mark mark-${size} mark-avatar`} src={source} alt="" aria-hidden="true" loading="lazy" draggable={false} />;
   }
   return (
     <span className={`mark mark-${size}`} aria-hidden="true">

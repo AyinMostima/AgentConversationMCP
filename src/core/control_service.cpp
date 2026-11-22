@@ -210,6 +210,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         // One consistent view plus the event watermark the console resumes from.
         return {{"projects", conversations_.list_projects()},
                 {"agents", identity_.list_agents()},
+                // Avatars the operator replaced: {slot: version}. Others are the built-in ones.
+                {"avatars", custom_avatars()},
                 {"conversations", conversations_.list_all()},
                 {"sessions", identity_.list_sessions()},
                 {"proposals", conversations_.list_proposals()},
@@ -233,6 +235,41 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     }
     if (operation == "create_agent") {
         return identity_.create_agent(args);
+    }
+    if (operation == "update_agent") {
+        return identity_.update_agent(target_id, args);
+    }
+    // The register of avatars the operator put in place of the built-in ones. The
+    // pictures themselves are files beside the store; the server keeps those.
+    if (operation == "set_avatar" || operation == "remove_avatar" || operation == "avatar") {
+        const std::string slot(target_id);
+        const bool plain = !slot.empty() && slot.size() <= 32 && std::ranges::all_of(slot, [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+        });
+        if (!plain) {
+            fail("INVALID_ARGUMENT", "an avatar is named by lowercase letters, digits, - and _");
+        }
+        const std::string key = "avatar." + slot;
+        if (operation == "set_avatar") {
+            const auto kind = require_string(args, "kind", 8);
+            if (kind != "png" && kind != "jpg" && kind != "gif" && kind != "webp") {
+                fail("INVALID_ARGUMENT", "an avatar is a PNG, JPEG, GIF or WebP picture");
+            }
+            // The time it was put in place is its version: a new picture gets a new address.
+            store_text_setting(database_, key, kind + ":" + to_rfc3339(clock_()));
+            events_.append("settings.changed", {}, "avatar", {{"slot", slot}, {"custom", true}});
+        } else if (operation == "remove_avatar") {
+            if (text_setting(database_, key)) {
+                erase_setting(database_, key);
+                events_.append("settings.changed", {}, "avatar", {{"slot", slot}, {"custom", false}});
+            }
+        }
+        const auto stored = text_setting(database_, key);
+        if (!stored) {
+            return json{{"slot", slot}, {"custom", false}};
+        }
+        const auto colon = stored->find(':');
+        return json{{"slot", slot}, {"custom", true}, {"kind", stored->substr(0, colon)}, {"version", stored->substr(colon + 1)}};
     }
     if (operation == "create_pairing") {
         return identity_.create_pairing(args);
@@ -275,10 +312,25 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             fail("INVALID_ARGUMENT", "alerts_enabled must be true or false");
         }
         // The operator's standing rules for every session; empty removes them.
-        const auto shared_rules = optional_string(args, "shared_rules", 6000);
+        // A text that may be given empty, which takes the setting away again.
+        const auto text_or_empty = [&](const char* field, std::size_t limit) -> std::optional<std::string> {
+            if (!args.contains(field)) {
+                return std::nullopt;
+            }
+            if (!args.at(field).is_string() || args.at(field).get<std::string>().size() > limit) {
+                fail("INVALID_ARGUMENT", std::format("{} must be a text of at most {} bytes", field, limit));
+            }
+            return args.at(field).get<std::string>();
+        };
+        const auto shared_rules = text_or_empty("shared_rules", 6000);
         if (args.contains("agent_compact") && !args.at("agent_compact").is_boolean()) {
             fail("INVALID_ARGUMENT", "agent_compact must be true or false");
         }
+        if (args.contains("avatars_enabled") && !args.at("avatars_enabled").is_boolean()) {
+            fail("INVALID_ARGUMENT", "avatars_enabled must be true or false");
+        }
+        // How the operator is called in the console; empty puts the default back.
+        const auto operator_name = text_or_empty("operator_name", 40);
         MessageLimits limits = message_limits(database_);
         const MessageLimits before = limits;
         limits.per_minute = optional_integer(args, "message_rate_per_minute", limits.per_minute, 0, 100000);
@@ -300,6 +352,13 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             }
             if (args.contains("agent_compact")) {
                 store_text_setting(database_, "agent_compact", args.at("agent_compact").get<bool>() ? "1" : "0");
+            }
+            if (args.contains("avatars_enabled")) {
+                store_text_setting(database_, "avatars_enabled", args.at("avatars_enabled").get<bool>() ? "1" : "0");
+            }
+            if (operator_name) {
+                operator_name->empty() ? erase_setting(database_, "operator_name")
+                                       : store_text_setting(database_, "operator_name", *operator_name);
             }
             if (shared_rules && *shared_rules != text_setting(database_, "shared_rules").value_or("")) {
                 shared_rules->empty() ? erase_setting(database_, "shared_rules")
@@ -919,6 +978,16 @@ json ControlService::own_wake_hook(const Session& session, const json& args) {
             {"queued_requests", row.integer(1)}};
 }
 
+json ControlService::custom_avatars() {
+    json found = json::object();
+    Statement rows = database_.query("SELECT key, value FROM settings WHERE key LIKE 'avatar.%' ORDER BY key");
+    while (rows.step()) {
+        const std::string value = rows.text(1);
+        found[rows.text(0).substr(7)] = value.substr(value.find(':') + 1);
+    }
+    return found;
+}
+
 json ControlService::settings_view() {
     const MessageLimits limits = message_limits(database_);
     return {{"open_mode", open_mode(database_)},
@@ -931,6 +1000,9 @@ json ControlService::settings_view() {
             // Standing rules the operator set for every session, and when they last changed.
             {"shared_rules", text_setting(database_, "shared_rules").value_or("")},
             {"shared_rules_at", text_setting(database_, "shared_rules_at").value_or("")},
+            // Whether the console shows faces or monograms, and what it calls the operator ("" is the default).
+            {"avatars_enabled", text_setting(database_, "avatars_enabled").value_or("1") == "1"},
+            {"operator_name", text_setting(database_, "operator_name").value_or("")},
             // Whether sessions may compact conversations (digest, keep, drop) by themselves.
             {"agent_compact", text_setting(database_, "agent_compact").value_or("1") == "1"},
             {"grok_bot_id", text_setting(database_, "grok_bot_id").value_or("")}};

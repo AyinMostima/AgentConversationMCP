@@ -327,10 +327,12 @@ export interface ServiceInfo {
 export interface Bootstrap {
   projects: Project[];
   agents: Agent[];
+  /** Avatars the operator replaced, as slot (a provider, or "operator") to version. */
+  avatars: Record<string, string>;
   conversations: Conversation[];
   sessions: Session[];
   proposals: Proposal[];
-  settings: { open_mode: boolean; message_rate_per_minute: number; message_rate_per_hour: number; duplicate_window_seconds: number; urgent_per_hour: number; shared_rules: string; shared_rules_at: string; alerts_enabled: boolean; grok_bot_id: string };
+  settings: { open_mode: boolean; message_rate_per_minute: number; message_rate_per_hour: number; duplicate_window_seconds: number; urgent_per_hour: number; shared_rules: string; shared_rules_at: string; avatars_enabled: boolean; operator_name: string; alerts_enabled: boolean; grok_bot_id: string };
   bot_requests: BotRequest[];
   wake_hooks: WakeHook[];
   client_hooks: ClientHook[];
@@ -386,6 +388,12 @@ export interface Api {
   renameWindow(windowId: string, name: string): Promise<{ window_id: string; name: string }>;
   setAlerts(enabled: boolean): Promise<Bootstrap['settings']>;
   setSharedRules(text: string): Promise<Bootstrap['settings']>;
+  setAvatarsEnabled(enabled: boolean): Promise<Bootstrap['settings']>;
+  setOperatorName(name: string): Promise<Bootstrap['settings']>;
+  renameAgent(agentId: string, name: string): Promise<Agent>;
+  /** The file goes up as it is: no resizing, no re-encoding. */
+  uploadAvatar(slot: string, file: Blob): Promise<{ slot: string; custom: boolean; version?: string }>;
+  removeAvatar(slot: string): Promise<{ slot: string; custom: boolean }>;
   createConversation(body: { project_id: string; task_code: string; title: string; purpose?: string }): Promise<Conversation>;
   updateConversation(conversationId: string, body: { title?: string; task_code?: string; purpose?: string; archived?: boolean }): Promise<Conversation>;
   /** Deletes messages for good: all of them, or those older than that many days. */
@@ -451,6 +459,18 @@ export function createApi(token: string): Api {
     renameWindow: (id, name) => request('PUT', `/api/v1/windows/${id}`, { name }),
     setAlerts: (enabled) => request('PUT', '/api/v1/settings', { alerts_enabled: enabled }),
     setSharedRules: (text) => request('PUT', '/api/v1/settings', { shared_rules: text }),
+    setAvatarsEnabled: (enabled) => request('PUT', '/api/v1/settings', { avatars_enabled: enabled }),
+    setOperatorName: (name) => request('PUT', '/api/v1/settings', { operator_name: name }),
+    renameAgent: (id, name) => request('PUT', `/api/v1/agents/${id}`, { display_name: name }),
+    uploadAvatar: async (slot, file) => {
+      const response = await fetch(`/api/v1/avatars/${slot}`, { method: 'PUT', headers: { 'content-type': 'application/octet-stream', 'x-acm-admin-token': token }, body: file });
+      const envelope = await response.json();
+      if (!envelope.ok) {
+        throw new ApiError(envelope.error.code, envelope.error.message, response.status, envelope.error.details ?? {});
+      }
+      return envelope.result;
+    },
+    removeAvatar: (slot) => request('DELETE', `/api/v1/avatars/${slot}`),
     createConversation: (body) => request('POST', '/api/v1/conversations', body),
     setMembers: (id, expectedVersion, members) =>
       request('PUT', `/api/v1/conversations/${id}/members`, { expected_version: expectedVersion, members }),

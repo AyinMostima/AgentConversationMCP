@@ -943,6 +943,7 @@ const en = {
       'task.updated': 'Task updated',
       'project.created': 'Project created',
       'agent.created': 'Agent created',
+      'agent.updated': 'Agent renamed',
     } as Record<string, string>,
   },
   grok: {
@@ -962,6 +963,22 @@ const en = {
     langZh: '简体中文',
     resolvedEn: 'English',
     resolvedZh: 'Simplified Chinese',
+    identitiesTitle: 'Avatars & Names',
+    identitiesOn: (replaced: number) => (replaced > 0 ? `Showing avatars (${replaced} custom).` : 'Showing avatars beside messages and sessions.'),
+    identitiesOff: 'Avatars hidden; showing letter monograms.',
+    identitiesSwitch: 'Show avatars',
+    identitiesEditAria: 'Edit avatars and names',
+    identitiesIntro: 'Click an avatar to upload a custom PNG, JPEG, WebP, or GIF (stored at original resolution). Display names apply across the console and session rosters.',
+    operatorDefault: 'Operator',
+    avatarChange: 'Change image',
+    avatarChangeAria: (name: string) => `Change avatar for ${name}`,
+    avatarChanged: 'Avatar updated',
+    avatarRestore: 'Reset',
+    avatarRestored: 'Default avatar restored',
+    avatarsShown: 'Avatars shown',
+    avatarsHidden: 'Avatars hidden',
+    nameAria: (name: string) => `Display name for ${name}`,
+    nameSaved: 'Name saved',
     rulesTitle: 'Shared Rules',
     rulesNone: 'No shared rules set yet. Define standing instructions for all connected sessions.',
     rulesSome: (lines: number, at: string) => `${lines} line(s), updated ${at}. Delivered once per conversation.`,
@@ -1842,6 +1859,7 @@ const zhCN: typeof en = {
       'task.updated': '任务已更新',
       'project.created': '项目已创建',
       'agent.created': '代理已创建',
+      'agent.updated': '代理已改名',
     },
   },
   grok: {
@@ -1861,6 +1879,22 @@ const zhCN: typeof en = {
     langZh: '简体中文',
     resolvedEn: 'English',
     resolvedZh: '简体中文',
+    identitiesTitle: '头像与名称',
+    identitiesOn: (replaced: number) => (replaced > 0 ? `已开启头像显示，当前包含 ${replaced} 个自定义头像。` : '在消息时间线与列表中显示头像。'),
+    identitiesOff: '头像已关闭，当前显示首字母标识。',
+    identitiesSwitch: '显示头像',
+    identitiesEditAria: '编辑头像与名称',
+    identitiesIntro: '点击头像可上传自定义图片（支持 PNG、JPEG、WebP、GIF，保留原图清晰度）；修改后的名称同步应用于控制台及各会话列表。',
+    operatorDefault: '操作员',
+    avatarChange: '更换头像',
+    avatarChangeAria: (name: string) => `更换 ${name} 的头像`,
+    avatarChanged: '头像已更新',
+    avatarRestore: '恢复默认',
+    avatarRestored: '已恢复默认头像',
+    avatarsShown: '已开启头像显示',
+    avatarsHidden: '已隐藏头像',
+    nameAria: (name: string) => `${name} 的显示名称`,
+    nameSaved: '名称已保存',
     rulesTitle: '公用规则',
     rulesNone: '尚未设置。为所有已接入会话定义常驻操作规则。',
     rulesSome: (lines: number, at: string) => `共 ${lines} 行，${at} 更新，每个对话自动同步一次。`,
@@ -2019,6 +2053,8 @@ interface I18nState {
   t: Messages;
   setPref: (next: LanguagePref) => void;
   toggleLocale: () => void;
+  /** What the operator is called, when the operator chose a name; "" for the default. */
+  setOperatorName: (name: string) => void;
 }
 
 const I18nContext = createContext<I18nState | null>(null);
@@ -2026,7 +2062,12 @@ const I18nContext = createContext<I18nState | null>(null);
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [pref, setPrefState] = useState<LanguagePref>(readInitialPref);
   const locale: Locale = pref === 'auto' ? detectLocale() : pref;
-  const t = DICTIONARIES[locale];
+  const [operatorName, setOperatorName] = useState('');
+  // The operator's own name takes the place of the word wherever the console says who wrote something.
+  const t = useMemo<Messages>(() => {
+    const base = DICTIONARIES[locale];
+    return operatorName === '' ? base : { ...base, common: { ...base.common, operator: operatorName } };
+  }, [locale, operatorName]);
 
   const setPref = useCallback((next: LanguagePref) => {
     setPrefState(next);
@@ -2046,7 +2087,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     document.title = t.appTitle;
   }, [locale, t.appTitle]);
 
-  const value = useMemo<I18nState>(() => ({ pref, locale, t, setPref, toggleLocale }), [pref, locale, t, setPref, toggleLocale]);
+  const value = useMemo<I18nState>(() => ({ pref, locale, t, setPref, toggleLocale, setOperatorName }), [pref, locale, t, setPref, toggleLocale]);
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
 

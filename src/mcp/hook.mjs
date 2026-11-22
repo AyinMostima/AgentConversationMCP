@@ -35,7 +35,7 @@ import { pathToFileURL } from 'node:url';
 import { resolveDataDir } from './paths.mjs';
 
 const CLIENTS = ['claude', 'codex', 'antigravity'];
-const EVENTS = ['start', 'prompt', 'stop', 'watch'];
+const EVENTS = ['start', 'prompt', 'stop', 'watch', 'tool'];
 const HOST = '127.0.0.1';
 const CALL_TIMEOUT_MS = 2500;
 const STDIN_TIMEOUT_MS = 1500;
@@ -116,7 +116,9 @@ export function render(client, event, text) {
   if (event === 'stop') {
     return { stdout: JSON.stringify({ decision: 'block', reason: text }), stderr: '', code: 0 };
   }
-  const hookEventName = event === 'start' ? 'SessionStart' : 'UserPromptSubmit';
+  // "tool": after a tool call, in the middle of a turn. What is urgent for this
+  // conversation is put in front of the model now, not when the turn is over.
+  const hookEventName = event === 'start' ? 'SessionStart' : event === 'tool' ? 'PostToolUse' : 'UserPromptSubmit';
   return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: text } }), stderr: '', code: 0 };
 }
 

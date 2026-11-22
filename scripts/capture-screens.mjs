@@ -332,6 +332,27 @@ await shot('flow-release-bot-request', 'dark', desktop, async (page) => {
   await page.locator('.toast', { hasText: 'Released for execution' }).waitFor({ timeout: 5000 });
 });
 await shot('settings-light', 'light', desktop, toSettings);
+// Overview charts and the manage page, with something selected.
+const toOverview = async (page) => {
+  await page.getByRole('button', { name: 'Overview', exact: true }).click();
+  await page.locator('.viz-plot svg').waitFor();
+  await page.waitForTimeout(700);
+};
+await shot('overview-light-1440', 'light', desktop, toOverview);
+await shot('overview-dark-1440', 'dark', desktop, toOverview);
+await shot('overview-narrow-light', 'light', { width: 420, height: 860 }, toOverview);
+await shot('manage-light-1440', 'light', desktop, async (page) => {
+  await page.getByRole('button', { name: 'Batch', exact: true }).click();
+  await page.locator('.bulk-table tbody tr').nth(1).click();
+  await page.locator('.bulk-table tbody tr').nth(2).click();
+  await page.locator('.bulk-bar').waitFor();
+});
+await shot('manage-tasks-light', 'light', desktop, async (page) => {
+  await page.getByRole('button', { name: 'Batch', exact: true }).click();
+  await page.getByRole('tab', { name: 'Tasks' }).click();
+  await page.locator('.bulk-table tbody tr').first().click();
+  await page.locator('.bulk-bar').waitFor();
+});
 await shot('settings-remote-light', 'light', desktop, async (page) => {
   await toSettings(page);
   await page.getByRole('button', { name: 'ngrok settings' }).click();
@@ -358,6 +379,14 @@ await shot('flow-delivery-routes', 'light', desktop, async (page) => {
   await page.locator('.route', { hasText: 'Review hooks' }).first().waitFor({ timeout: 3000 });
   await page.locator('.route', { hasText: 'Last injected 1 message' }).waitFor({ timeout: 3000 });
   await page.locator('.routes').scrollIntoViewIfNeeded();
+});
+await shot('flow-digest-panel', 'light', desktop, async (page) => {
+  // Open the conversation digest and compaction drawer beside the timeline.
+  await page.getByRole('button', { name: /^Digest/ }).click();
+  await page.getByRole('heading', { name: 'Digest & Compaction' }).waitFor({ timeout: 3000 });
+  await page.getByText(/No digest yet/).waitFor({ timeout: 3000 });
+  await page.getByRole('button', { name: 'Write digest' }).click();
+  await page.getByPlaceholder(/Summarize decisions/).waitFor({ timeout: 3000 });
 });
 await shot('flow-flood-limits', 'light', desktop, async (page) => {
   await toSettings(page);
@@ -518,6 +547,8 @@ if (updateDocs) {
     ['flow-edit-conversation.png', 'conversation-menu.png'],
     ['flow-tidy-select.png', 'tidy.png'],
     ['wake-hook-light.png', 'wake-hook.png'],
+    ['overview-light-1440.png', 'overview.png'],
+    ['manage-light-1440.png', 'batch.png'],
   ];
   for (const [src, dst] of docsMap) {
     copyFileSync(join(outDir, src), join(docsDir, dst));

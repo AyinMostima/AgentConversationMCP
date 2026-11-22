@@ -85,9 +85,63 @@ export interface Conversation {
   goal_updated_at: string | null;
   /** topic: opened by the operator. lobby: every linked session. direct: two sessions. */
   kind: 'topic' | 'lobby' | 'direct';
+  /** What a reader that is behind gets in place of the history. */
+  digest: { text: string; upto_seq: number; written_at: string; by: string } | null;
+  /** How many messages compacting kept in front of readers, or took out of what is read into a context. */
+  context_counts: { kept: number; dropped: number; resolved: number };
   members: Member[];
   /** Direct conversations only: sessions of the pair that are currently out, and why. */
   former_members?: { session_id: string; label: string; display_name: string; removed_reason: 'operator' | 'unlinked' }[];
+}
+
+/** One act of compacting, from the event log. */
+export interface Compaction {
+  at: string;
+  by: string;
+  upto_seq: number;
+  digest_bytes: number;
+  kept: number;
+  dropped: number;
+  resolved: number;
+  restored: number;
+}
+
+/** Counts for the overview; never any text of a conversation. */
+export interface Stats {
+  days: number;
+  from: string;
+  to: string;
+  bucket: 'hour' | 'day';
+  messages: number;
+  urgent: number;
+  active_windows: number;
+  series: { at: string; messages: number; urgent: number }[];
+  senders: { name: string; label: string | null; provider: string | null; messages: number }[];
+  windows: { name: string; app: string; messages: number }[];
+  /** `members`: who talks there (display names), which tells direct conversations apart. */
+  conversations: { conversation_id: string; kind: Conversation['kind']; title: string; task_code: string; messages: number; members: string }[];
+  deliveries: Record<'ok' | 'failed' | 'skipped' | 'running', number>;
+  delivery_routes: Record<string, Record<'ok' | 'failed' | 'skipped' | 'running', number>>;
+  tasks: Record<TaskStatus, number>;
+}
+
+/** One digest a conversation was given; `current` is the one readers get. */
+export interface DigestEntry {
+  digest_id: number;
+  text: string;
+  upto_seq: number;
+  written_at: string;
+  by: string;
+  current: boolean;
+}
+
+export interface CompactBody {
+  summary?: string;
+  upto_seq?: number;
+  keep?: number[];
+  drop?: number[];
+  resolve?: number[];
+  restore?: number[];
 }
 
 export type ReceiptStatus = 'available' | 'read' | 'acknowledged';
@@ -112,6 +166,8 @@ export interface Message {
   directed: boolean;
   /** Marked urgent by its sender: it interrupts its readers instead of waiting for their next turn. */
   urgent: boolean;
+  /** Compacting kept it in front of readers, or took it out of what is read into a context. */
+  context: 'kept' | 'dropped' | 'resolved' | null;
   /** The window that wrote it, when known, and the windows it is meant for (empty: all of them). */
   from_window: { window_id: string; name: string } | null;
   to_windows: { window_id: string; name: string }[];
@@ -332,6 +388,12 @@ export interface Api {
   updateConversation(conversationId: string, body: { title?: string; task_code?: string; purpose?: string; archived?: boolean }): Promise<Conversation>;
   /** Deletes messages for good: all of them, or those older than that many days. */
   clearConversation(conversationId: string, olderThanDays: number): Promise<Conversation & { deleted_messages: number }>;
+  compactConversation(conversationId: string, body: CompactBody): Promise<{ digest: Conversation['digest']; kept_messages: number; dropped_messages: number; resolved_messages: number }>;
+  compactions(conversationId: string): Promise<{ compactions: Compaction[] }>;
+  digests(conversationId: string): Promise<{ digests: DigestEntry[] }>;
+  stats(days: number): Promise<Stats>;
+  /** Puts an earlier digest back in use in place of the current one. */
+  useDigest(conversationId: string, digestId: number): Promise<{ digest: Conversation['digest']; digests: DigestEntry[] }>;
   deleteConversation(conversationId: string): Promise<{ deleted: boolean; deleted_messages: number; deleted_tasks: number }>;
   setMembers(
     conversationId: string,
@@ -394,6 +456,11 @@ export function createApi(token: string): Api {
     sendMessage: (id, body) => request('POST', `/api/v1/conversations/${id}/messages`, body),
     updateConversation: (id, body) => request('PUT', `/api/v1/conversations/${id}`, body),
     clearConversation: (id, olderThanDays) => request('POST', `/api/v1/conversations/${id}/clear`, olderThanDays > 0 ? { older_than_days: olderThanDays } : {}),
+    compactConversation: (id, body) => request('POST', `/api/v1/conversations/${id}/compact`, body),
+    compactions: (id) => request('GET', `/api/v1/conversations/${id}/compactions`),
+    digests: (id) => request('GET', `/api/v1/conversations/${id}/digests`),
+    stats: (days) => request('GET', `/api/v1/stats?days=${days}`),
+    useDigest: (id, digestId) => request('PUT', `/api/v1/conversations/${id}/digest`, { digest_id: digestId }),
     deleteConversation: (id) => request('DELETE', `/api/v1/conversations/${id}`),
     setGoal: (id, goal) => request('PUT', `/api/v1/conversations/${id}/goal`, goal === null ? {} : { goal }),
     tasks: (id) => request('GET', `/api/v1/conversations/${id}/tasks`),

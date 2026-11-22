@@ -30,7 +30,8 @@ function parseOptions(argv) {
     mcpPort: 8765,
     corePort: 8766,
     coreExe: process.env.ACM_CORE_EXE ?? join(repoRoot, 'build', 'windows-dev', 'RelWithDebInfo', 'acm-core.exe'),
-    uiDir: join(repoRoot, 'ui', 'dist'),
+    // A console built elsewhere (for example to try it beside the running service) is served with ACM_UI_DIR.
+    uiDir: process.env.ACM_UI_DIR ?? join(repoRoot, 'ui', 'dist'),
   };
   const names = { '--data-dir': 'dataDir', '--mcp-port': 'mcpPort', '--core-port': 'corePort', '--core-exe': 'coreExe', '--ui-dir': 'uiDir' };
   for (let index = 0; index < argv.length; index += 2) {

@@ -223,6 +223,34 @@ json Board::tasks(std::string_view conversation_id, bool include_closed) {
     return list;
 }
 
+std::int64_t Board::close(const Session* actor, std::string_view conversation_id, const json& handles,
+                          const std::string& note) {
+    if (!handles.is_array() || handles.size() > 100) {
+        fail("INVALID_ARGUMENT", "close_tasks must be a list of at most 100 task numbers or task ids");
+    }
+    std::int64_t closed = 0;
+    for (const auto& handle : handles) {
+        Statement row = handle.is_number_integer()
+                            ? database_.query("SELECT task_id, status FROM tasks WHERE conversation_id = ? AND number = ?",
+                                              conversation_id, handle.get<std::int64_t>())
+                            : handle.is_string()
+                                  ? database_.query("SELECT task_id, status FROM tasks WHERE conversation_id = ? AND task_id = ?",
+                                                    conversation_id, handle.get<std::string>())
+                                  : database_.query("SELECT task_id, status FROM tasks WHERE 0");
+        if (!row.step()) {
+            fail("NOT_FOUND", std::format("this conversation has no task {}", handle.dump()), {{"task", handle}});
+        }
+        const std::string task_id = row.text(0);
+        const std::string status = row.text(1);
+        if (status == "done" || status == "cancelled") {
+            continue;
+        }
+        update(actor, {{"task_id", task_id}, {"status", "done"}, {"note", note}});
+        ++closed;
+    }
+    return closed;
+}
+
 json Board::task_row(std::string_view task_id) {
     Statement row = database_.query(
         "SELECT t.task_id, t.conversation_id, t.number, t.title, t.detail, t.status, t.assignee_session_id, "

@@ -259,6 +259,24 @@ describe('client hooks and urgent delivery', { concurrency: false }, () => {
     note('helper-threads', { withRecord: 'a window', withoutRecord: 'not addressed, not woken' });
   });
 
+  it('carries an urgent message into a turn that is under way, after its next tool call', async () => {
+    const tool = () => hook('codex', 'tool', { session_id: 'thread-9', hook_event_name: 'PostToolUse', tool_name: 'Bash' });
+    await hook('codex', 'prompt', { session_id: 'thread-9' });
+    // Nothing urgent: a tool call adds nothing and costs nothing.
+    assert.deepEqual(await tool(), { code: 0, stdout: '', stderr: '' });
+    await say('claude', 'halt: wrong branch', { urgent: true });
+    // The turn does not have to end, and nobody has to steer it: the next tool call carries the message.
+    const mid = JSON.parse((await tool()).stdout).hookSpecificOutput;
+    assert.equal(mid.hookEventName, 'PostToolUse');
+    assert.match(mid.additionalContext, /^\[ACM\] Urgent: 1 message\(s\) marked urgent/);
+    assert.match(mid.additionalContext, /halt: wrong branch/);
+    // Once: not with later tool calls, and not again when the turn ends.
+    assert.equal((await tool()).stdout, '');
+    assert.equal((await hook('codex', 'stop', { session_id: 'thread-9' })).stdout, '');
+    assert.equal((await hooksOf('codex')).last_urgent.route, 'tool');
+    note('urgent-in-turn', { codex: 'PostToolUse hookSpecificOutput.additionalContext', once: true });
+  });
+
   it('caps how many messages a session may mark urgent', async () => {
     // Codex marked one message urgent earlier in this run; the second is its last.
     await service.admin('PUT', '/api/v1/settings', { urgent_per_hour: 2, message_rate_per_minute: 0 });

@@ -23,6 +23,12 @@
 //                (codex exec resume) is off unless ACM_CODEX_CLI=on: such a
 //                turn is invisible in the app and holds the thread while it
 //                runs.
+//                fallback  codex exec [resume <stand-in>] <text>
+//                        when Codex says the thread does not exist any more
+//                        (deleted, or a helper thread it did not keep): a new
+//                        command-line conversation stands in for the window, in
+//                        its working directory, and is continued on every later
+//                        wake. Without it such a window could not be reached at all.
 //
 //   antigravity  agy [--conversation <id>] --print <text>
 //                Antigravity's command line keeps its conversations apart from
@@ -63,10 +69,13 @@ const OPEN_PATIENCE_SECONDS = 120;
 // before it is given up.
 const OPEN_SPACING_MS = 10000;
 
-const STAND_IN_NOTE = (window) =>
-  `[ACM] You were started from the command line as a stand-in for the Antigravity desktop conversation "${window}", ` +
-  'which is idle and cannot be started from outside. You do not have that conversation\'s history: work from this ' +
+const STAND_IN_NOTE = (window, why = 'the Antigravity desktop conversation "%s", which is idle and cannot be started from outside') =>
+  `[ACM] You were started from the command line as a stand-in for ${why.replace('%s', window)}. ` +
+  'You do not have that conversation\'s history: work from this ' +
   'directory and from the request below, and say in your report that the command-line stand-in did the work.\n\n';
+const CODEX_GONE = 'the Codex conversation "%s", which Codex no longer has (its thread was deleted or never kept)';
+// What a command says about the conversation it used: Antigravity's conversation_id, Codex's thread_id.
+const USED = /"(?:conversation_id|thread_id)"\s*:\s*"([0-9a-f-]{8,64})"/i;
 
 /**
  * The routes per client: {name, long, standIn, step, patience, command(job,
@@ -118,6 +127,23 @@ export function dispatchRoutes(env = process.env) {
           command: (job) => (job.attempt === 1 || job.attempt === 2 ? undefined : { file: process.execPath, args: [codexEntry, 'exec', 'resume', '--skip-git-repo-check', job.client_session, job.text] }),
         });
       }
+      // Only once Codex said the thread is gone (see deliver): a new conversation stands in for it.
+      routes.codex.push({
+        name: 'codex exec (new conversation)',
+        long: true,
+        standIn: true,
+        whenGone: true,
+        command: (job, memory) => {
+          const known = /^[0-9a-f-]{8,64}$/i.test(memory[job.window_id] ?? '') ? memory[job.window_id] : undefined;
+          const text = `${STAND_IN_NOTE(job.window, CODEX_GONE)}${job.text}`;
+          // The user's own Codex settings decide what it may do; its hooks stay out of it, as for Antigravity's stand-in.
+          return {
+            file: process.execPath,
+            args: known === undefined ? [codexEntry, 'exec', '--skip-git-repo-check', '--json', text] : [codexEntry, 'exec', 'resume', '--skip-git-repo-check', '--json', known, text],
+            env: { ACM_HOOKS: 'off' },
+          };
+        },
+      });
     }
     const agy = join(env.LOCALAPPDATA ?? '', 'agy', 'bin', 'agy.exe');
     if (existsSync(agy)) {
@@ -154,6 +180,7 @@ export function dispatchRoutes(env = process.env) {
         name: words.slice(0, 2).join(' '),
         long: !Array.isArray(entry) && entry.long === true,
         standIn: !Array.isArray(entry) && entry.standIn === true,
+        whenGone: !Array.isArray(entry) && entry.whenGone === true,
         step: !Array.isArray(entry) && (Number.isInteger(entry.step) || Array.isArray(entry.step)) ? entry.step : undefined,
         spacingMs: !Array.isArray(entry) && Number.isInteger(entry.spacing) ? entry.spacing : undefined,
         patience: !Array.isArray(entry) && Number.isInteger(entry.patience) ? entry.patience : undefined,
@@ -313,7 +340,12 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
   async function deliver(job) {
     const attempt = Number.isInteger(job.attempt) ? job.attempt : 0;
     let outcome = { ok: false, detail: attempt > 0 ? 'the application did not start this conversation; the message is in its queue and is taken up when the conversation is opened there' : 'no command applies to this conversation' };
+    // Whether the client said this conversation does not exist: then only a route meant for that is left.
+    let gone = false;
     for (const route of routes[job.client] ?? []) {
+      if (route.whenGone === true ? !gone : gone) {
+        continue;
+      }
       // Each step of a handing over has its route; one that runs the turn itself fits any step.
       const steps = route.step ?? (route.long ? attempt : 0);
       if (!(Array.isArray(steps) ? steps.includes(attempt) : steps === attempt)) {
@@ -329,7 +361,7 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
       if (route.standIn) {
         standingIn.set(job.client, job.window_id);
       }
-      const resumed = route.standIn && command.args.includes('--conversation');
+      const resumed = route.standIn && (command.args.includes('--conversation') || command.args.includes('resume'));
       if (route.spacingMs !== undefined) {
         const wait = (lastRun.get(route.name) ?? 0) + route.spacingMs - Date.now();
         if (wait > 0) {
@@ -359,7 +391,7 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
             standingIn.delete(job.client);
             // The command says which conversation it used; that one is continued next
             // time, when the turn in it went well. One that failed is not kept.
-            const [, conversation] = /"conversation_id"\s*:\s*"([0-9a-f-]{8,64})"/i.exec(output) ?? [];
+            const [, conversation] = USED.exec(output) ?? [];
             if (failure !== undefined) {
               if (resumed) {
                 remember(job.window_id, undefined);
@@ -385,8 +417,9 @@ export function startDispatcher({ coreUrl, adminToken, dataDir, intervalMs = 500
       }
       if (GONE.test(result.detail ?? '') && !route.standIn) {
         // The conversation does not exist for this client: another command of it will not find it either.
+        // A route meant for that may still start a new conversation in its place.
         outcome.gone = true;
-        break;
+        gone = true;
       }
     }
     return outcome;

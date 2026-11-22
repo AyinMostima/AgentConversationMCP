@@ -103,7 +103,7 @@ describe('MCP transport contract', { concurrency: false }, () => {
     const names = tools.map((tool) => tool.name).sort();
     assert.equal(info.name, 'agent-conversation-mcp');
     assert.deepEqual(names, [
-      'acknowledge_message', 'bot_pull', 'bot_request', 'bot_requests', 'bot_respond', 'check_in', 'create_task', 'direct_message', 'forward_message', 'get_artifact', 'get_conversation', 'get_inbox', 'get_session',
+      'acknowledge_message', 'bot_pull', 'bot_request', 'bot_requests', 'bot_respond', 'check_in', 'compact_conversation', 'create_task', 'direct_message', 'forward_message', 'get_artifact', 'get_conversation', 'get_inbox', 'get_session',
       'list_conversations', 'list_tasks', 'name_window', 'propose_conversation', 'publish_artifact', 'read_messages', 'report_progress', 'request_pairing',
       'send_message', 'update_task',
     ]);
@@ -285,7 +285,9 @@ describe('MCP transport contract', { concurrency: false }, () => {
     const entry = first.result.conversations[0];
     assert.equal(entry.goal, goalText);
     assert.equal(entry.tasks.length, 1);
-    assert.equal(entry.tasks[0].assignee.session_id, sessions.codex1);
+    // check_in carries a task as an overview: who holds it by label; list_tasks has every field.
+    assert.equal(typeof entry.tasks[0].assignee, 'string');
+    assert.equal(entry.tasks[0].conversation_id, undefined);
     assert.ok(entry.new_messages.every((message) => message.sender.session_id !== sessions.claude), 'own messages are not repeated');
     assert.equal((await callTool(clients.claude, 'check_in', { conversation_id: conversationId })).result.conversations[0].new_messages.length, 0);
     const news = `${mark('news')} verification started`;

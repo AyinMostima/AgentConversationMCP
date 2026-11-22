@@ -350,6 +350,8 @@ json Messages::inbox(const Session& session, const json& args) {
             "JOIN conversations c ON c.conversation_id = m.conversation_id AND c.status = 'open' "
             "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.session_id = r.session_id "
             "WHERE r.session_id = ? AND r.status <> 'acknowledged' AND cm.removed_at IS NULL AND cm.can_read = 1 "
+            // What compacting dropped or resolved is no longer anybody's to answer.
+            "AND m.context >= 0 "
             "AND (? IS NULL OR m.conversation_id = ?) ORDER BY m.created_at, m.conversation_id, m.seq LIMIT ?",
             session.session_id, only_conversation, only_conversation, limit + 1);
         while (rows.step()) {
@@ -506,10 +508,48 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
         conversation_id, window != nullptr ? std::optional<std::string>(window->window_id) : std::nullopt,
         session.session_id);
     cursor.step();
+    const std::int64_t read_upto = cursor.integer(0);
+    Statement place = database_.query(
+        "SELECT next_seq - 1, digest_seq, kind FROM conversations WHERE conversation_id = ?", conversation_id);
+    place.step();
+    const std::int64_t last = place.integer(0);
+    const std::int64_t digest_seq = place.integer(1);
+    const bool direct = place.text(2) == "direct";
+    // The newest `limit`, after the digest when that covers more.
+    std::int64_t start = std::max(read_upto, last - limit);
+    const bool digested = digest_seq > read_upto;
+    if (digested) {
+        start = std::max(start, digest_seq);
+    }
     json page = read(session, {{"conversation_id", std::string(conversation_id)},
-                               {"after_seq", cursor.integer(0)},
+                               {"after_seq", start},
                                {"limit", limit}});
     advance_cursor(session, conversation_id, page.at("next_cursor").get<std::int64_t>(), window);
+    if (digested) {
+        page["digest"] = conversations_.digest(conversation_id);
+    }
+    // Messages from before `start` that compacting kept in front of readers: they come along in full.
+    if (start > read_upto) {
+        json kept = json::array();
+        Statement rows = database_.query(
+            "SELECT m.message_id FROM messages m WHERE m.conversation_id = ?1 AND m.seq > ?2 AND m.seq <= ?3 "
+            "AND m.context = 1 AND COALESCE(m.sender_session_id, '') <> ?4 AND (m.directed = 0 OR EXISTS "
+            "(SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?4)) "
+            "ORDER BY m.seq LIMIT 40",
+            conversation_id, read_upto, start, session.session_id);
+        std::vector<std::string> ids;
+        while (rows.step()) {
+            ids.push_back(rows.text(0));
+        }
+        for (const auto& id : ids) {
+            kept.push_back(message_view(id, &session));
+        }
+        if (!kept.empty()) {
+            page["kept_messages"] = std::move(kept);
+        }
+    }
+    // Left out without a digest to stand for them.
+    page["skipped_earlier"] = std::max<std::int64_t>(0, start - std::max(read_upto, digest_seq));
     // The caller already knows what it sent itself. What another window of the
     // same session wrote is news to it, as far as the two can be told apart.
     json others = json::array();
@@ -518,9 +558,35 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
         const json& author = message.at("from_window");
         const bool told_apart = window != nullptr && !author.is_null();
         const bool own = same_session && (!told_apart || author.at("window_id") == json(window->window_id));
-        if (!own) {
-            others.push_back(std::move(message));
+        if (own) {
+            continue;
         }
+        // Dropped by compacting: not read into anybody's context. read_messages still shows it.
+        if (message.at("context") == json("dropped") || message.at("context") == json("resolved")) {
+            continue;
+        }
+        // In full when it is for this reader: its window is named, it is for its session
+        // alone, or this is its direct conversation. Otherwise an overview is enough here.
+        const bool named = window != nullptr && std::ranges::any_of(message.at("to_windows"), [&](const json& target) {
+            return target.at("window_id") == json(window->window_id);
+        });
+        // An urgent message that names other windows is theirs, not this reader's.
+        const bool for_reader = named || direct || message.value("directed", false) ||
+                                (message.value("urgent", false) && message.at("to_windows").empty()) ||
+                                message.at("context") == json("kept");
+        if (!for_reader && message.at("body").is_string()) {
+            std::string body = message.at("body").get<std::string>();
+            if (body.size() > kOverviewBytes) {
+                std::size_t end = kOverviewBytes;
+                while (end > 0 && (static_cast<unsigned char>(body[end]) & 0xC0) == 0x80) {
+                    --end;
+                }
+                body.resize(end);
+                message["body"] = body + " [... cut; read_messages has the rest]";
+                message["cut"] = true;
+            }
+        }
+        others.push_back(std::move(message));
     }
     page["messages"] = std::move(others);
     return page;
@@ -556,7 +622,8 @@ std::int64_t Messages::pending_count(const Session& session) {
         "SELECT COUNT(*) FROM message_recipients r JOIN messages m ON m.message_id = r.message_id "
         "JOIN conversations c ON c.conversation_id = m.conversation_id AND c.status = 'open' "
         "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.session_id = r.session_id "
-        "WHERE r.session_id = ? AND r.status <> 'acknowledged' AND cm.removed_at IS NULL AND cm.can_read = 1",
+        "WHERE r.session_id = ? AND r.status <> 'acknowledged' AND cm.removed_at IS NULL AND cm.can_read = 1 "
+        "AND m.context >= 0",
         session.session_id);
     row.step();
     return row.integer(0);
@@ -599,7 +666,7 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
     Statement row = database_.query(
         "SELECT m.message_id, m.conversation_id, m.seq, m.sender_kind, m.sender_session_id, m.kind, m.body, "
         "m.payload, m.reply_to_message_id, m.directed, m.created_at, s.agent_id, s.label, a.provider, "
-        "a.display_name, m.forwarded_from, m.urgent, m.author_window_id, w.name FROM messages m "
+        "a.display_name, m.forwarded_from, m.urgent, m.author_window_id, w.name, m.context FROM messages m "
         "LEFT JOIN agent_sessions s ON s.session_id = m.sender_session_id "
         "LEFT JOIN agents a ON a.agent_id = s.agent_id "
         "LEFT JOIN windows w ON w.window_id = m.author_window_id WHERE m.message_id = ?",
@@ -626,6 +693,11 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
                    {"provider", nullable(row.optional_text(13))},
                    {"display_name", nullable(row.optional_text(14))}}}};
     // The window that wrote it, when known, and the windows it is meant for; empty means all of them.
+    // Whether compacting kept it in front of readers, or took it out of what is read into a context.
+    view["context"] = row.integer(19) > 0     ? json("kept")
+                      : row.integer(19) == -2 ? json("resolved")
+                      : row.integer(19) < 0   ? json("dropped")
+                                              : json(nullptr);
     view["from_window"] = row.is_null(17) ? json(nullptr)
                                           : json{{"window_id", row.text(17)}, {"name", row.optional_text(18).value_or("")}};
     json targets = json::array();

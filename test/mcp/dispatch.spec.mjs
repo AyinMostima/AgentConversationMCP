@@ -41,6 +41,21 @@ writeFileSync(
 );
 // Stands in for a command that only hands something on: notes what it was given in the file named first.
 writeFileSync(noting, "import { appendFileSync } from 'node:fs';\nappendFileSync(process.argv[2], JSON.stringify([...process.argv.slice(3), Date.now()]) + '\\n');\n");
+// Stand in for Codex when the thread is gone: the queue does not know it, and a new conversation is started instead.
+const goneFile = join(base, 'gone.jsonl');
+const freshFile = join(base, 'fresh.jsonl');
+const forgetting = join(base, 'gone-stand-in.mjs');
+const freshening = join(base, 'fresh-stand-in.mjs');
+writeFileSync(forgetting, `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(goneFile)}, JSON.stringify(process.argv.slice(2)) + '\\n');\nconsole.error('Error: failed to queue session message: no rollout found for thread id ' + process.argv[2]);\nprocess.exit(1);\n`);
+writeFileSync(
+  freshening,
+  [
+    "import { appendFileSync } from 'node:fs';",
+    `appendFileSync(${JSON.stringify(freshFile)}, JSON.stringify({ args: process.argv.slice(2) }) + '\\n');`,
+    "console.log(JSON.stringify({ type: 'thread.started', thread_id: '0199bbbb-1111-2222-3333-555555555555' }));",
+    'setTimeout(() => process.exit(0), 1500);',
+  ].join('\n'),
+);
 process.env.ACM_DISPATCH_INTERVAL_MS = '250';
 process.env.ACM_DISPATCH_GRACE_MS = '600';
 process.env.ACM_DISPATCH_COMMANDS = JSON.stringify({
@@ -50,6 +65,7 @@ process.env.ACM_DISPATCH_COMMANDS = JSON.stringify({
     { command: [process.execPath, noting, queuedFile], step: 0, patience: 5 },
     { command: [process.execPath, noting, openedFile], step: [1, 2], patience: 5, spacing: 2500 },
   ],
+  forgetful: [[process.execPath, forgetting], { command: [process.execPath, freshening], long: true, standIn: true, whenGone: true }],
 });
 
 let service;
@@ -115,7 +131,19 @@ describe('idle dispatch through the clients\' command lines', { concurrency: fal
 
     const job = { window_id: 'win_1', window: 'iso', client_session: 'thread-1', text: 'do it' };
     // Codex: into the thread's queue, then the desktop app is asked to open the thread. No command-line turn.
-    assert.deepEqual(routes.codex.map((route) => [route.name, route.step, route.long]), [['codex queue', 0, false], ['open in Codex desktop', [1, 2], false]]);
+    assert.deepEqual(routes.codex.map((route) => [route.name, route.step, route.long]), [['codex queue', 0, false], ['open in Codex desktop', [1, 2], false], ['codex exec (new conversation)', undefined, true]]);
+    // The last one is only for a thread Codex does not have any more: a new conversation stands in for it.
+    const fresh = routes.codex[2];
+    assert.equal(fresh.whenGone, true);
+    assert.equal(fresh.standIn, true);
+    const started = fresh.command(job, {});
+    assert.deepEqual(started.args.slice(1, 4), ['exec', '--skip-git-repo-check', '--json']);
+    assert.match(started.args.at(-1), /^\[ACM\] You were started from the command line as a stand-in for the Codex conversation "iso", which Codex no longer has/);
+    assert.ok(started.args.at(-1).endsWith('do it'));
+    assert.deepEqual(started.env, { ACM_HOOKS: 'off' });
+    // Later wakes continue the conversation that stood in before.
+    const continued = fresh.command(job, { win_1: '0199aaaa-1111-2222-3333-444444444444' });
+    assert.deepEqual(continued.args.slice(1, 6), ['exec', 'resume', '--skip-git-repo-check', '--json', '0199aaaa-1111-2222-3333-444444444444']);
     assert.ok(routes.codex[1].spacingMs >= 5000, 'the app is not asked for two threads in the same instant');
     assert.deepEqual(routes.codex[0].command(job).args.slice(1), ['queue', '--thread', 'thread-1', '--message', 'do it']);
     const uuid = { ...job, client_session: '01a1f740-8164-7423-bad4-18972bd6686f' };
@@ -124,7 +152,7 @@ describe('idle dispatch through the clients\' command lines', { concurrency: fal
     assert.equal(routes.codex[1].command({ ...job, client_session: 'x" & calc' }), undefined);
     // Running the turn from the command line is something the operator switches on.
     const withCli = dispatchRoutes({ USERPROFILE: home, APPDATA: join(home, 'AppData', 'Roaming'), LOCALAPPDATA: join(home, 'AppData', 'Local'), ACM_CODEX_CLI: 'on' });
-    assert.deepEqual(withCli.codex.map((route) => route.name), ['codex queue', 'open in Codex desktop', 'codex exec resume']);
+    assert.deepEqual(withCli.codex.map((route) => route.name), ['codex queue', 'open in Codex desktop', 'codex exec resume', 'codex exec (new conversation)']);
     assert.equal(withCli.codex[2].command({ ...job, attempt: 2 }), undefined);
     assert.deepEqual(withCli.codex[2].command({ ...job, attempt: 3 }).args.slice(1), ['exec', 'resume', '--skip-git-repo-check', 'thread-1', 'do it']);
 
@@ -227,5 +255,25 @@ describe('idle dispatch through the clients\' command lines', { concurrency: fal
     assert.equal(lines(openedFile)[2][0], 'helper-thread-2');
     await sleep(9000);
     assert.equal(lines(openedFile).length, 3, 'and not a third time');
+  });
+
+  it('starts a new conversation in place of one the client does not have any more, and remembers it for the next wake', async () => {
+    const forgetful = (await cli('forgetful', 'call', 'get_session')).session_id;
+    const token = JSON.parse(readFileSync(join(dataDir, 'identities', 'forgetful.json'), 'utf8')).token;
+    const response = await fetch(`http://127.0.0.1:${instance[3]}/internal/v1/hook`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ event: 'stop', client: 'forgetful', client_session: 'deleted-thread-1', cwd: base }) });
+    const name = (await response.json()).result.window.name;
+    // Nothing for it while nobody names it.
+    assert.equal(lines(freshFile).length, 0);
+    await cli('claude', 'call', 'send_message', '--json', JSON.stringify({ conversation_id: lobby, body: 'forgetful: rerun the audit', urgent: true, to_windows: [name], idempotency_key: `k${++key}` }));
+    // The client says the thread is gone; the fallback starts a new conversation with the request.
+    await waitFor(() => lines(freshFile).length === 1, 20000, 'a new conversation to be started');
+    assert.deepEqual(lines(goneFile).map((entry) => entry[0]), ['deleted-thread-1']);
+    assert.match(lines(freshFile)[0].args.at(-1), /forgetful: rerun the audit/);
+    // Reported as handed over by the fallback, not as a conversation that is gone.
+    const status = async () => (await service.admin('GET', '/api/v1/bootstrap')).client_hooks.find((entry) => entry.session_id === forgetful);
+    await waitFor(async () => (await status())?.last_urgent?.status === 'ok', 10000, 'the delivery to be reported');
+    assert.match((await status()).last_urgent.detail, /fresh-stand-in\.mjs/);
+    // The new conversation is remembered for that window, so the next wake continues it.
+    await waitFor(() => Object.values(JSON.parse(readFileSync(join(dataDir, 'stand-ins.json'), 'utf8'))).includes('0199bbbb-1111-2222-3333-555555555555'), 10000, 'the new conversation to be remembered');
   });
 });

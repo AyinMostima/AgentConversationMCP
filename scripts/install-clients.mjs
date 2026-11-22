@@ -15,7 +15,7 @@
 // client's own conversation (src/mcp/hook.mjs), again in each client's folder:
 //
 //   claude       %USERPROFILE%\.claude\settings.json     SessionStart, UserPromptSubmit, Stop
-//   codex        %USERPROFILE%\.codex\hooks.json         SessionStart, UserPromptSubmit, Stop
+//   codex        %USERPROFILE%\.codex\hooks.json         SessionStart, UserPromptSubmit, Stop, PostToolUse
 //   antigravity  %USERPROFILE%\.gemini\config\hooks.json  SessionStart, PreInvocation, Stop
 //
 // Codex runs a hook only after the person reviewed it once in the app
@@ -178,6 +178,9 @@ function codexHooks() {
     SessionStart: { matcher: 'startup|resume', hooks: [run('start')] },
     UserPromptSubmit: { hooks: [run('prompt')] },
     Stop: { hooks: [run('stop')] },
+    // After every tool call: an urgent message for this thread reaches the model in
+    // the middle of its turn, without waiting for the turn to end.
+    PostToolUse: { hooks: [{ ...run('tool'), timeout: 5 }] },
   });
   if (remove && !existsSync(file)) {
     return 'hooks: none installed';

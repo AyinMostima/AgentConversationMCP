@@ -312,12 +312,20 @@ std::string Windows::state_of(std::string_view event, std::string_view seen_at,
     return "idle";
 }
 
-json Windows::of_session(std::string_view session_id, const Window* self) {
+std::int64_t Windows::count_of_session(std::string_view session_id) {
+    Statement row = database_.query("SELECT COUNT(*) FROM windows WHERE session_id = ? AND seen_at > ? AND addressable = 1",
+                                    session_id, to_rfc3339(clock_() - std::chrono::seconds(kLiveSeconds)));
+    row.step();
+    return row.integer(0);
+}
+
+json Windows::of_session(std::string_view session_id, const Window* self, std::int64_t limit) {
     json windows = json::array();
     Statement rows = database_.query(
-        "SELECT window_id, name, event, seen_at, watch_seen_at, cwd, imported, title FROM windows WHERE session_id = ? "
-        "AND seen_at > ? AND addressable = 1 ORDER BY seen_at DESC LIMIT 40",
-        session_id, to_rfc3339(clock_() - std::chrono::seconds(kLiveSeconds)));
+        "SELECT window_id, name, event, seen_at, watch_seen_at, cwd, imported, title FROM windows WHERE session_id = ?1 "
+        "AND seen_at > ?2 AND addressable = 1 ORDER BY (window_id = ?3) DESC, seen_at DESC LIMIT ?4",
+        session_id, to_rfc3339(clock_() - std::chrono::seconds(kLiveSeconds)),
+        self != nullptr ? self->window_id : std::string(), limit);
     while (rows.step()) {
         windows.push_back({{"window_id", rows.text(0)},
                            {"name", rows.text(1)},

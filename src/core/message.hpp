@@ -81,6 +81,11 @@ public:
     // With a window, the cursor is that window's own: two windows of one session
     // each catch up from where they themselves stopped, and each sees what the
     // other wrote.
+    // A reader that is far behind is not handed the whole history: it gets the
+    // conversation's digest for what that covers, the newest `limit` messages, and
+    // how many between were left out (skipped_earlier; read_messages has them). A
+    // message that is not addressed to the reader comes cut to kOverviewBytes.
+    static constexpr std::size_t kOverviewBytes = 500;
     json unread(const Session& session, std::string_view conversation_id, std::int64_t limit,
                 const Window* window = nullptr);
 

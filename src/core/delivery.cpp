@@ -14,7 +14,7 @@ json nullable(const std::optional<std::string>& value) {
 }
 
 bool is_event(std::string_view event) {
-    return event == "start" || event == "prompt" || event == "stop" || event == "watch";
+    return event == "start" || event == "prompt" || event == "stop" || event == "watch" || event == "tool";
 }
 
 // Cuts at a character boundary: the text is UTF-8 and goes into a model's context.
@@ -72,10 +72,21 @@ std::vector<Delivery::Pending> Delivery::pending(std::string_view session_id, st
         " OR EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id AND t.window_id = ?2)) "
         "AND m.kind IN ('message', 'handoff', 'decision') "
         "AND m.rowid > ?3 AND (?4 = 0 OR m.urgent = 1) "
+        // What a digest of the conversation covers is not listed message by message any
+        // more, unless compacting kept it; what compacting dropped is not listed at all.
+        "AND m.context >= 0 AND (m.seq > c.digest_seq OR m.context = 1) "
+        // A direct conversation belongs to the windows of this session that write in it:
+        // the others are not shown its traffic. When none of them can be told (nobody of
+        // this session wrote there from a known window), every window sees it.
+        "AND (c.kind <> 'direct' "
+        " OR EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id AND t.window_id = ?2) "
+        " OR EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = m.conversation_id AND o.author_window_id = ?2) "
+        " OR NOT EXISTS (SELECT 1 FROM messages o JOIN windows ow ON ow.window_id = o.author_window_id "
+        "                WHERE o.conversation_id = m.conversation_id AND ow.session_id = ?1)) "
         // Not what an urgent route already put in front of this window (or is handing to
         // its client this moment): each such delivery covered the urgent messages of a range.
         "AND NOT (m.urgent = 1 AND EXISTS (SELECT 1 FROM deliveries d WHERE d.window_id = ?2 "
-        " AND d.route IN ('stop', 'watch', 'command') AND d.status IN ('running', 'ok') AND d.stand_in = 0 "
+        " AND d.route IN ('stop', 'watch', 'command', 'tool') AND d.status IN ('running', 'ok') AND d.stand_in = 0 "
         " AND d.from_rowid IS NOT NULL AND m.rowid > d.from_rowid AND m.rowid <= d.upto_rowid)) "
         "ORDER BY m.rowid LIMIT ?5",
         session_id, window_id, floor, urgent_only, limit);
@@ -126,7 +137,7 @@ std::vector<Delivery::Pending> Delivery::interrupting(std::string_view session_i
         // For the session as such: one of its windows deals with it, not each in turn.
         return database_
             .query("SELECT 1 FROM deliveries WHERE session_id = ? AND window_id <> ? "
-                   "AND route IN ('stop', 'watch', 'command') AND status IN ('running', 'ok') "
+                   "AND route IN ('stop', 'watch', 'command', 'tool') AND status IN ('running', 'ok') "
                    "AND from_rowid IS NOT NULL AND ? > from_rowid AND ? <= upto_rowid",
                    session_id, window_id, entry.rowid, entry.rowid)
             .step();
@@ -145,7 +156,7 @@ std::string Delivery::compose(const std::vector<Pending>& listed, std::int64_t m
     if (listed.empty()) {
         return {};
     }
-    const bool interrupting = route == "stop" || route == "watch" || route == "command";
+    const bool interrupting = route == "stop" || route == "watch" || route == "command" || route == "tool";
     const auto urgent = std::ranges::count_if(listed, [](const Pending& entry) { return entry.urgent; });
     std::string text;
     if (interrupting) {
@@ -163,7 +174,8 @@ std::string Delivery::compose(const std::vector<Pending>& listed, std::int64_t m
     for (const auto& entry : listed) {
         text += std::format("\n{}. {}{} in {}{}, {}:\n{}\n", ++number, entry.urgent ? "[URGENT] " : "", entry.from,
                             entry.where, entry.to_you ? ", addressed to this window" : "", entry.created_at,
-                            clip(entry.body, entry.urgent ? kUrgentBodyBytes : kBodyBytes));
+                            clip(entry.body, entry.urgent ? kUrgentBodyBytes
+                                                          : entry.to_you || entry.personal ? kBodyBytes : kBriefBytes));
     }
     text += "\n";
     if (more > 0) {
@@ -187,7 +199,7 @@ std::string Delivery::compose(const std::vector<Pending>& listed, std::int64_t m
 json Delivery::hook(const Session& session, const json& args) {
     const auto event = require_string(args, "event", 16);
     if (!is_event(event)) {
-        fail("INVALID_ARGUMENT", "event must be start, prompt, stop or watch");
+        fail("INVALID_ARGUMENT", "event must be start, prompt, stop, watch or tool");
     }
     const auto client = optional_string(args, "client", 32);
     const auto client_session = optional_string(args, "client_session", 256);
@@ -233,11 +245,12 @@ json Delivery::hook(const Session& session, const json& args) {
             database_.execute("UPDATE windows SET watch_seen_at = ?, watch_id = ? WHERE window_id = ?", now, *watch_id,
                               window.window_id);
         } else if (!peek) {
+            // A tool call happens inside a turn: the window is in one, as after a prompt.
             database_.execute(
                 "UPDATE windows SET event = ?, seen_at = ?, runs = runs + 1, hooked = 1, "
                 "client = CASE WHEN ? IS NULL OR ? = '' THEN client ELSE ? END, cwd = COALESCE(?, cwd) "
                 "WHERE window_id = ?",
-                event, now, client, client, client, cwd, window.window_id);
+                event == "tool" ? std::string("prompt") : event, now, client, client, client, cwd, window.window_id);
         }
         if (persistent) {
             database_.execute("UPDATE windows SET addressable = ? WHERE window_id = ?",
@@ -255,7 +268,7 @@ json Delivery::hook(const Session& session, const json& args) {
         if (urgent_only) {
             // The guard against windows interrupting each other without end.
             Statement recent = database_.query(
-                "SELECT COUNT(*) FROM deliveries WHERE window_id = ? AND route IN ('stop', 'watch', 'command') "
+                "SELECT COUNT(*) FROM deliveries WHERE window_id = ? AND route IN ('stop', 'watch', 'command', 'tool') "
                 "AND status NOT IN ('failed', 'skipped') AND created_at > ?",
                 window.window_id, to_rfc3339(moment - std::chrono::seconds(kWindowSeconds)));
             recent.step();
@@ -296,6 +309,45 @@ json Delivery::hook(const Session& session, const json& args) {
         result["urgent"] = urgent;
         result["more"] = more;
         result["text"] = compose(listed, more, event, window.name);
+        // A conversation that was summarized since this window last read it: the digest is
+        // put in front of the window once, in place of the messages it covers.
+        if (!urgent_only) {
+            Statement due = database_.query(
+                "SELECT c.conversation_id, c.kind, c.title, c.digest, c.digest_seq, c.digest_by, c.digest_at "
+                "FROM conversations c JOIN conversation_members cm ON cm.conversation_id = c.conversation_id "
+                "AND cm.session_id = ?1 AND cm.removed_at IS NULL AND cm.can_read = 1 "
+                "LEFT JOIN window_cursors wc ON wc.window_id = ?2 AND wc.conversation_id = c.conversation_id "
+                "WHERE c.status = 'open' AND c.digest IS NOT NULL AND c.digest_seq > COALESCE(wc.read_seq, 0) "
+                "AND c.digest_seq > COALESCE(wc.digest_seen, 0) ORDER BY c.digest_at DESC LIMIT 2",
+                session.session_id, window.window_id);
+            std::string digests;
+            std::vector<std::pair<std::string, std::int64_t>> shown_digests;
+            while (due.step()) {
+                const std::string kind = due.text(1);
+                const std::string where = kind == "lobby"    ? std::string("the lobby")
+                                          : kind == "direct" ? std::string("a direct conversation with you")
+                                                             : std::format("\"{}\"", due.text(2));
+                digests += std::format(
+                    "[ACM] Digest of {} up to message {}, written by {} ({}). It stands for the earlier messages there, "
+                    "which are not listed for you one by one; read_messages has them if you need one:\n{}\n\n",
+                    where, due.integer(4), due.optional_text(5).value_or("a member"), due.optional_text(6).value_or(""),
+                    clip(due.text(3), kDigestBytes));
+                shown_digests.emplace_back(due.text(0), due.integer(4));
+            }
+            if (!digests.empty()) {
+                const std::string rest = result.at("text").get<std::string>();
+                result["text"] = rest.empty() ? digests.substr(0, digests.size() - 2) : digests + rest;
+                result["digests"] = shown_digests.size();
+                if (!peek) {
+                    for (const auto& [conversation, seq] : shown_digests) {
+                        database_.execute(
+                            "INSERT INTO window_cursors (window_id, conversation_id, read_seq, digest_seen) VALUES (?, ?, 0, ?) "
+                            "ON CONFLICT (window_id, conversation_id) DO UPDATE SET digest_seen = excluded.digest_seen",
+                            window.window_id, conversation, seq);
+                    }
+                }
+            }
+        }
         // The operator's shared rules go in front of a conversation once: when it starts
         // or next takes a prompt after they changed. They are the operator's, and say so.
         if (!urgent_only) {
@@ -456,7 +508,7 @@ json Delivery::claim(const json& args) {
                 " AND created_at >= ?3), "
                 "(SELECT COUNT(*) FROM deliveries WHERE window_id = ?1 AND route = 'command' AND status = 'failed' "
                 " AND created_at > ?4), "
-                "(SELECT COUNT(*) FROM deliveries WHERE window_id = ?1 AND route IN ('stop', 'watch', 'command') "
+                "(SELECT COUNT(*) FROM deliveries WHERE window_id = ?1 AND route IN ('stop', 'watch', 'command', 'tool') "
                 " AND status NOT IN ('failed', 'skipped') AND created_at > ?5)",
                 candidate.window_id, ago(kMinIntervalSeconds), candidate.seen_at, ago(kRetrySeconds),
                 ago(kWindowSeconds));
@@ -633,7 +685,7 @@ json Delivery::view(std::string_view session_id) {
                 {"window", nullable(found.optional_text(6))}};
     };
     view["last_delivery"] = latest("");
-    view["last_urgent"] = latest("AND d.route IN ('stop', 'watch', 'command')");
+    view["last_urgent"] = latest("AND d.route IN ('stop', 'watch', 'command', 'tool')");
     return view;
 }
 

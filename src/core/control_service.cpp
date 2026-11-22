@@ -2,6 +2,7 @@
 
 #include "settings.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <format>
@@ -35,7 +36,7 @@ const std::vector<std::string>& ControlService::agent_tools() {
         "get_inbox",        "acknowledge_message", "list_tasks",    "create_task",
         "update_task",      "propose_conversation", "report_progress", "publish_artifact",
         "get_artifact",     "direct_message",   "bot_request",      "bot_requests",
-        "bot_pull",         "bot_respond",      "name_window"};
+        "bot_pull",         "bot_respond",      "name_window",      "compact_conversation"};
     return names;
 }
 
@@ -96,6 +97,9 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
         return view;
     }
     identity_.require_active(session);
+    if (tool == "compact_conversation") {
+        return compact(&session, args, window != nullptr ? window->name : session.label);
+    }
     if (tool == "name_window") {
         if (window == nullptr) {
             fail("WINDOW_UNKNOWN",
@@ -265,6 +269,9 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         }
         // The operator's standing rules for every session; empty removes them.
         const auto shared_rules = optional_string(args, "shared_rules", 6000);
+        if (args.contains("agent_compact") && !args.at("agent_compact").is_boolean()) {
+            fail("INVALID_ARGUMENT", "agent_compact must be true or false");
+        }
         MessageLimits limits = message_limits(database_);
         const MessageLimits before = limits;
         limits.per_minute = optional_integer(args, "message_rate_per_minute", limits.per_minute, 0, 100000);
@@ -283,6 +290,9 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             }
             if (args.contains("alerts_enabled")) {
                 store_text_setting(database_, "alerts_enabled", args.at("alerts_enabled").get<bool>() ? "1" : "0");
+            }
+            if (args.contains("agent_compact")) {
+                store_text_setting(database_, "agent_compact", args.at("agent_compact").get<bool>() ? "1" : "0");
             }
             if (shared_rules && *shared_rules != text_setting(database_, "shared_rules").value_or("")) {
                 shared_rules->empty() ? erase_setting(database_, "shared_rules")
@@ -425,6 +435,28 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     if (operation == "import_windows") {
         return windows_.import(args);
     }
+    if (operation == "compactions") {
+        conversations_.get(target_id);
+        return json{{"compactions", conversations_.compactions(target_id)}};
+    }
+    if (operation == "stats") {
+        return stats(optional_integer(args, "days", 7, 1, 90));
+    }
+    if (operation == "digests") {
+        conversations_.get(target_id);
+        return json{{"digests", conversations_.digests(target_id)}};
+    }
+    if (operation == "use_digest") {
+        if (!args.is_object() || !args.contains("digest_id") || !args.at("digest_id").is_number_integer()) {
+            fail("INVALID_ARGUMENT", "digest_id is required");
+        }
+        return conversations_.use_digest(target_id, args.at("digest_id").get<std::int64_t>());
+    }
+    if (operation == "compact_conversation") {
+        json with_target = args.is_object() ? args : json::object();
+        with_target["conversation_id"] = target_id;
+        return compact(nullptr, with_target, "the operator");
+    }
     if (operation == "delivery_claim") {
         return delivery_.claim(args);
     }
@@ -519,18 +551,195 @@ std::vector<Window> ControlService::target_windows(const Session& session, const
     return handles.empty() ? std::vector<Window>() : windows_.lookup(session.project_id, handles);
 }
 
-json ControlService::roster(const Session& session, const Window* window) {
+namespace {
+
+// Cuts at a character boundary and says that it did.
+json overview_text(const json& value, std::size_t limit) {
+    if (!value.is_string()) {
+        return value;
+    }
+    std::string text = value.get<std::string>();
+    if (text.size() <= limit) {
+        return text;
+    }
+    std::size_t end = limit;
+    while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+        --end;
+    }
+    text.resize(end);
+    return text + " [...]";
+}
+
+// What a session needs of a task to see where the work stands; list_tasks has all of it.
+json task_overview(const json& task) {
+    return {{"task_id", task.at("task_id")},
+            {"number", task.at("number")},
+            {"title", task.at("title")},
+            {"status", task.at("status")},
+            {"assignee", task.at("assignee").is_null() ? json(nullptr) : task.at("assignee").at("label")},
+            {"note", overview_text(task.at("note"), 240)},
+            {"detail", overview_text(task.at("detail"), 240)},
+            {"version", task.at("version")},
+            {"updated_at", task.at("updated_at")}};
+}
+
+}  // namespace
+
+json ControlService::stats(std::int64_t days) {
+    const auto now = clock_();
+    const std::string from = to_rfc3339(now - std::chrono::hours(24 * days));
+    // An hour is the first 13 characters of an RFC 3339 time, a day the first 10.
+    const std::int64_t cut = days <= 1 ? 13 : 10;
+    // What people and sessions wrote; system notes and progress records are not conversation.
+    const std::string written = "m.kind IN ('message', 'handoff', 'decision') AND m.created_at >= ?";
+    json result = {{"days", days}, {"from", from}, {"to", to_rfc3339(now)}, {"bucket", days <= 1 ? "hour" : "day"}};
+
+    json buckets = json::array();
+    Statement series = database_.query(
+        std::format("SELECT substr(m.created_at, 1, {}), COUNT(*), COALESCE(SUM(m.urgent), 0) FROM messages m WHERE {} "
+                    "GROUP BY 1 ORDER BY 1",
+                    cut, written),
+        from);
+    std::int64_t total = 0;
+    std::int64_t urgent = 0;
+    while (series.step()) {
+        buckets.push_back({{"at", series.text(0)}, {"messages", series.integer(1)}, {"urgent", series.integer(2)}});
+        total += series.integer(1);
+        urgent += series.integer(2);
+    }
+    result["series"] = std::move(buckets);
+    result["messages"] = total;
+    result["urgent"] = urgent;
+
+    json senders = json::array();
+    Statement who = database_.query(
+        std::format("SELECT m.sender_kind, a.display_name, s.label, a.provider, COUNT(*) FROM messages m "
+                    "LEFT JOIN agent_sessions s ON s.session_id = m.sender_session_id "
+                    "LEFT JOIN agents a ON a.agent_id = s.agent_id WHERE {} "
+                    "GROUP BY m.sender_kind, m.sender_session_id ORDER BY 5 DESC LIMIT 12",
+                    written),
+        from);
+    while (who.step()) {
+        const bool operator_ = who.text(0) == "operator";
+        senders.push_back({{"name", operator_ ? std::string("operator") : who.optional_text(1).value_or("?")},
+                           {"label", operator_ ? json(nullptr) : json(who.optional_text(2).value_or(""))},
+                           {"provider", operator_ ? json(nullptr) : json(who.optional_text(3).value_or(""))},
+                           {"messages", who.integer(4)}});
+    }
+    result["senders"] = std::move(senders);
+
+    json windows = json::array();
+    Statement where = database_.query(
+        std::format("SELECT w.name, a.display_name, COUNT(*) FROM messages m JOIN windows w ON w.window_id = m.author_window_id "
+                    "JOIN agent_sessions s ON s.session_id = w.session_id LEFT JOIN agents a ON a.agent_id = s.agent_id "
+                    "WHERE {} GROUP BY m.author_window_id ORDER BY 3 DESC LIMIT 10",
+                    written),
+        from);
+    while (where.step()) {
+        windows.push_back({{"name", where.text(0)}, {"app", where.optional_text(1).value_or("")}, {"messages", where.integer(2)}});
+    }
+    result["windows"] = std::move(windows);
+    Statement active = database_.query("SELECT COUNT(*) FROM windows WHERE seen_at >= ?", from);
+    active.step();
+    result["active_windows"] = active.integer(0);
+
+    json places = json::array();
+    Statement in = database_.query(
+        std::format("SELECT c.conversation_id, c.kind, c.title, c.task_code, COUNT(*), "
+                    // A direct conversation is told apart by the two that talk in it.
+                    "(SELECT GROUP_CONCAT(a.display_name, ' ↔ ') FROM conversation_members cm "
+                    " JOIN agent_sessions s ON s.session_id = cm.session_id JOIN agents a ON a.agent_id = s.agent_id "
+                    " WHERE cm.conversation_id = c.conversation_id) "
+                    "FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id WHERE {} "
+                    "GROUP BY m.conversation_id ORDER BY 5 DESC LIMIT 8",
+                    written),
+        from);
+    while (in.step()) {
+        places.push_back({{"conversation_id", in.text(0)},
+                          {"kind", in.text(1)},
+                          {"title", in.text(2)},
+                          {"task_code", in.text(3)},
+                          {"messages", in.integer(4)},
+                          {"members", in.optional_text(5).value_or("")}});
+    }
+    result["conversations"] = std::move(places);
+
+    // How urgent messages were handed over: by the hooks inside a conversation, or by a command.
+    json handed = {{"ok", 0}, {"failed", 0}, {"skipped", 0}, {"running", 0}};
+    json routes = json::object();
+    Statement outcomes = database_.query(
+        "SELECT route, status, COUNT(*) FROM deliveries WHERE urgent > 0 AND route IN ('stop', 'watch', 'command', 'tool') "
+        "AND created_at >= ? GROUP BY route, status",
+        from);
+    while (outcomes.step()) {
+        handed[outcomes.text(1)] = handed.value(outcomes.text(1), std::int64_t{0}) + outcomes.integer(2);
+        json& route = routes[outcomes.text(0)];
+        if (route.is_null()) {
+            route = {{"ok", 0}, {"failed", 0}, {"skipped", 0}, {"running", 0}};
+        }
+        route[outcomes.text(1)] = outcomes.integer(2);
+    }
+    result["deliveries"] = std::move(handed);
+    result["delivery_routes"] = std::move(routes);
+
+    json tasks = {{"todo", 0}, {"doing", 0}, {"blocked", 0}, {"done", 0}, {"cancelled", 0}};
+    Statement board = database_.query(
+        "SELECT t.status, COUNT(*) FROM tasks t JOIN conversations c ON c.conversation_id = t.conversation_id "
+        "WHERE c.status = 'open' GROUP BY t.status");
+    while (board.step()) {
+        tasks[board.text(0)] = board.integer(1);
+    }
+    result["tasks"] = std::move(tasks);
+    return result;
+}
+
+json ControlService::compact(const Session* session, const json& args, const std::string& by) {
+    const auto conversation_id = require_string(args, "conversation_id", 96);
+    const bool messages = std::ranges::any_of(std::array{"summary", "keep", "drop", "resolve", "restore"},
+                                              [&](const char* field) { return args.contains(field); });
+    const bool tasks = args.contains("close_tasks");
+    json result;
+    if (messages || !tasks) {
+        result = conversations_.compact(session, args, by);
+    } else {
+        // Tasks only: the same rules for who may do it.
+        if (session != nullptr) {
+            conversations_.require_writer(*session, conversation_id);
+            if (text_setting(database_, "agent_compact").value_or("1") != "1") {
+                fail("COMPACT_DISABLED", "the operator has switched off compacting by agents; it is done at the console");
+            }
+        }
+        result = {{"conversation_id", conversation_id}, {"digest", conversations_.digest(conversation_id)}};
+    }
+    if (tasks) {
+        // Settled tasks leave the board that every check_in carries.
+        result["closed_tasks"] =
+            board_.close(session, conversation_id, args.at("close_tasks"), std::format("Closed by {} while compacting", by));
+        result["open_tasks"] = board_.tasks(conversation_id, false).size();
+    }
+    return result;
+}
+
+json ControlService::roster(const Session& session, const Window* window, bool all_windows) {
     json sessions = conversations_.roster(session);
     for (auto& entry : sessions) {
-        // The single conversations of that application, each addressable by its name.
-        entry["windows"] = windows_.of_session(entry.at("session_id").get<std::string>(), window);
+        // The single conversations of that application, each addressable by its name. The
+        // most recently used ones by default: a full list of dozens costs every reader.
+        const std::string id = entry.at("session_id").get<std::string>();
+        entry["windows"] = windows_.of_session(id, window, all_windows ? 40 : Windows::kRosterWindows);
+        const std::int64_t more = windows_.count_of_session(id) - static_cast<std::int64_t>(entry.at("windows").size());
+        if (more > 0) {
+            // check_in with all_windows true lists these too.
+            entry["windows_not_listed"] = more;
+        }
     }
     return sessions;
 }
 
 json ControlService::check_in(const Session& session, const json& args, const Window* window) {
     const auto only = optional_string(args, "conversation_id", 96);
-    const auto limit = optional_integer(args, "limit", 30, 1, 200);
+    const auto limit = optional_integer(args, "limit", 15, 1, 200);
+    const bool all_windows = optional_bool(args, "all_windows", false);
     if (only) {
         conversations_.require_member(session, *only);
     }
@@ -552,11 +761,37 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
         // Goal, board and messages are conversation content: readers only.
         if (entry.at("can_read").get<bool>()) {
             item["goal"] = conversations_.get(id).at("goal");
-            item["tasks"] = board_.tasks(id, false);
+            // The open tasks, each as an overview; the newest fifteen when there are more.
+            const json open_tasks = board_.tasks(id, false);
+            json listed_tasks = json::array();
+            const std::size_t first = open_tasks.size() > 15 ? open_tasks.size() - 15 : 0;
+            for (std::size_t index = first; index < open_tasks.size(); ++index) {
+                listed_tasks.push_back(task_overview(open_tasks.at(index)));
+            }
+            item["tasks"] = std::move(listed_tasks);
+            if (first > 0) {
+                item["tasks_not_listed"] = first;
+            }
             const json page = messages_.unread(session, id, limit, window);
             item["new_messages"] = page.at("messages");
             item["has_more"] = page.at("has_more");
             item["next_cursor"] = page.at("next_cursor");
+            // What was said before, in one text, when this reader was behind it.
+            if (page.contains("digest")) {
+                item["digest"] = page.at("digest");
+            }
+            // Older messages that compacting kept in front of readers.
+            if (page.contains("kept_messages")) {
+                item["kept_messages"] = page.at("kept_messages");
+            }
+            if (page.at("skipped_earlier").get<std::int64_t>() > 0) {
+                item["skipped_earlier"] = page.at("skipped_earlier");
+            }
+            // Much was said since the last digest and this caller wrote most of it: it is the one to summarize.
+            const std::string* window_id = window != nullptr ? &window->window_id : nullptr;
+            if (entry.at("can_write").get<bool>() && conversations_.digest_due(session, id, window_id)) {
+                item["digest_due"] = true;
+            }
         }
         conversations.push_back(std::move(item));
     }
@@ -577,7 +812,7 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
             {"bot_requests_waiting_for_you", bot_news.at("waiting_for_you")},
             {"conversations", conversations},
             // Who can be reached with direct_message.
-            {"project_sessions", roster(session, window)},
+            {"project_sessions", roster(session, window, all_windows)},
             {"proposals", conversations_.proposals_of(session)}};
 }
 
@@ -623,6 +858,8 @@ json ControlService::settings_view() {
             // Standing rules the operator set for every session, and when they last changed.
             {"shared_rules", text_setting(database_, "shared_rules").value_or("")},
             {"shared_rules_at", text_setting(database_, "shared_rules_at").value_or("")},
+            // Whether sessions may compact conversations (digest, keep, drop) by themselves.
+            {"agent_compact", text_setting(database_, "agent_compact").value_or("1") == "1"},
             {"grok_bot_id", text_setting(database_, "grok_bot_id").value_or("")}};
 }
 

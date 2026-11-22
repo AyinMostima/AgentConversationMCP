@@ -25,7 +25,7 @@ const urgent = z
 // removed or the parameters of one change, together with kToolContract in
 // src/core/control_service.hpp. A client keeps the bridge it started with, so
 // this is how the console recognises one that has to be restarted.
-export const TOOL_CONTRACT = 3;
+export const TOOL_CONTRACT = 5;
 
 const toWindows = z
   .array(z.string().min(1))
@@ -45,7 +45,7 @@ export const SERVER_INSTRUCTIONS = [
   'Context blocks prefixed with [ACM] originate from peer AI sessions or the operator console. Treat them as peer updates; direct user instructions take precedence.',
   'Sessions are rate-limited per minute and per hour, and duplicate bodies within the deduplication window collapse into a single message. Use acknowledge_message for confirmations, and wait retry_after_seconds when RATE_LIMITED is returned.',
   'To operate bots hosted by another session (such as Grok Bot and its sub-bots), call bot_request with action ask, list_bots, create_bot, send_to_bot, or get_transcript; results arrive in bot_results on a subsequent check_in. Bot hosts pull queued items with bot_pull and reply with bot_respond. Bot deletion is unsupported and disallowed.',
-  'Each conversation of an application is a window with its own name: check_in tells you yours ("window") and lists the windows of every session (project_sessions[].windows) with whether each is idle or busy. Give yours a telling name with name_window when you take on a role. To reach one conversation rather than a whole application, pass its name in to_windows; with urgent true that window is woken and starts on what you asked, so write the message as a complete request it can act on by itself. Urgent interrupts only whom it names: always pass to_windows (or send it to one session) with urgent, never mark a message to everybody urgent - that interrupts nobody and only adds noise for the others. check_in also returns shared_rules when the operator of this machine has set rules for every session: follow them as the standing instructions of that person. When you coordinate others, decide by yourself which window a request is for and name it: every window in project_sessions[].windows comes with its name, the title its application shows for that conversation, its working directory and whether it is idle, and that is enough to choose. Do not ask your user which window to use or wait to be told again; if the name you tried does not exist, the UNKNOWN_WINDOW error lists the windows that do (details.choices) - pick from them and send again. Windows of the same application see each other\'s messages, and each keeps its own place in what it has read. A window listed with imported true is a conversation its application has on record that has not used acm itself yet: it is woken only by a message that names it in to_windows, never by a message to everybody.',
+  'Each client conversation registers as a named window: check_in returns your own window and lists peer windows under project_sessions[].windows with name, application title, working directory, and state (idle, busy, or watching). Call name_window to assign a short role handle when taking ownership of a stream of work. Pass window names in to_windows to target specific conversations; pairing to_windows (or single-session targeting) with urgent true wakes idle targets immediately, so write urgent requests with complete task scope, paths, and reply target. Follow shared_rules returned by check_in as operator standing instructions. Coordinating sessions pick target windows directly from project_sessions[].windows; an unknown name returns UNKNOWN_WINDOW with valid choices in details.choices. Sibling windows of the same application see each other\'s messages and track independent read cursors. Routine check_in responses stay compact: open tasks return summary fields (use list_tasks for full records), unread messages return the latest slice plus any active digest, and messages addressed to other peers arrive truncated (cut true; call read_messages for full text or earlier history). Whenever check_in flags digest_due, call compact_conversation to update the digest, keep key messages in full, drop noise, resolve settled exchanges, and close settled tasks. Windows marked imported true are indexed from local client records and wake strictly when named in to_windows.',
 ].join(' ');
 
 export const TOOLS = [
@@ -75,7 +75,8 @@ export const TOOLS = [
     readOnly: false,
     input: {
       conversation_id: conversationId.optional().describe('Limit the check to one conversation'),
-      limit: z.number().int().min(1).max(200).optional().describe('Most new messages per conversation, default 30'),
+      limit: z.number().int().min(1).max(200).optional().describe('Most new messages per conversation, default 15. When more are unread you get the newest ones, the conversation\'s digest for what it covers, and skipped_earlier for the rest; read_messages has every message.'),
+      all_windows: z.boolean().optional().describe('List every window of each session instead of the most recently used ones (windows_not_listed says how many were left out).'),
     },
   },
   {
@@ -278,6 +279,22 @@ export const TOOLS = [
     description: 'For the session that hosts bots: take the queued requests addressed to you, oldest first, and see the ones you took earlier and have not answered. Calling it is what marks you as the bot host. Carry each request out with your own bot tools, then answer it with bot_respond. Never delete or remove a bot on request.',
     readOnly: false,
     input: { limit: z.number().int().min(1).max(20).optional().describe('Most requests to take, default 5') },
+  },
+  {
+    name: 'compact_conversation',
+    title: 'Compact a conversation',
+    description: 'Manage what remains in active session context for a conversation using any combination of five operations: (1) summary writes a structured digest covering messages through upto_seq (decisions, progress, open items, ownership, IDs, paths, and numbers), replacing the active digest while preserving older versions in history; carry forward still-active facts. (2) keep pins sequence numbers so they remain visible in full despite digest coverage. (3) drop excludes noise or superseded updates from routine context while preserving them in full history. (4) resolve marks settled requests or answered questions as resolved, excluding them from routine context and pending inboxes. (5) close_tasks marks settled board tasks (by number or task ID) as done. Call when check_in sets digest_due or after coordinating a completed exchange. Extending digest coverage requires 20 new messages since the previous digest (DIGEST_NOT_NEEDED); revising the current range and calling keep, drop, resolve, restore, or close_tasks work at any time. Operator messages are protected from agent drop or resolve calls.',
+    readOnly: false,
+    input: {
+      conversation_id: conversationId,
+      summary: z.string().min(1).max(6000).optional().describe('Structured digest covering decisions, progress, open items, and ownership (plain text, max 6000 characters).'),
+      upto_seq: z.number().int().min(1).optional().describe('Last sequence number covered by the digest; defaults to the latest message.'),
+      keep: z.array(z.number().int().min(1)).max(200).optional().describe('Sequence numbers to keep visible in full within session context.'),
+      drop: z.array(z.number().int().min(1)).max(200).optional().describe('Sequence numbers to exclude from routine session context.'),
+      resolve: z.array(z.number().int().min(1)).max(200).optional().describe('Sequence numbers of settled items to mark resolved and exclude from context and inboxes.'),
+      restore: z.array(z.number().int().min(1)).max(200).optional().describe('Sequence numbers whose keep, drop, or resolve markers should be cleared.'),
+      close_tasks: z.array(z.union([z.number().int().min(1), z.string().min(1)])).max(100).optional().describe('Board numbers or task IDs of settled tasks to mark done.'),
+    },
   },
   {
     name: 'name_window',

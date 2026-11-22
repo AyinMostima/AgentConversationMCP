@@ -434,6 +434,151 @@ TEST_CASE("an urgent message for a session goes to one of its windows, and not t
     REQUIRE(reached.at("text").get<std::string>().contains("click the page"));
 }
 
+TEST_CASE("compacting decides what of a conversation is still read into a context", "[window][compact]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    // Thirty messages in the lobby; Codex has read none of them.
+    for (int i = 1; i <= 30; ++i) {
+        f.say(f.claude, nullptr, i == 3 ? "SPEC: tables use UTC and SHA-256" : i == 5 ? "test chatter, ignore" : "report number " + std::to_string(i));
+    }
+    // The coordinator compacts: a digest of all of it, the specification stays readable in full, the chatter goes.
+    json done = f.conversations.compact(&f.claude, {{"conversation_id", f.lobby},
+                                                    {"summary", "DIGEST-1: thirty reports are in; the build is green."},
+                                                    {"keep", {3}},
+                                                    {"drop", {5}}},
+                                        "coord");
+    REQUIRE(done.at("digest").at("upto_seq") == 30);
+    REQUIRE(done.at("digest").at("by") == "coord");
+    REQUIRE(done.at("kept_messages") == 1);
+    REQUIRE(done.at("dropped_messages") == 1);
+
+    // In its client's hooks a window that was behind is shown the digest once, the kept message, and no history.
+    const json first = f.hook(f.codex, "codex", "conv-a", "prompt");
+    const std::string shown = first.at("text");
+    REQUIRE(shown.contains("Digest of the lobby up to message 30, written by coord"));
+    REQUIRE(shown.contains("DIGEST-1: thirty reports are in"));
+    REQUIRE(shown.contains("SPEC: tables use UTC and SHA-256"));
+    REQUIRE_FALSE(shown.contains("report number 7"));
+    REQUIRE_FALSE(shown.contains("test chatter"));
+    REQUIRE(first.at("count") == 1);
+    REQUIRE(f.hook(f.codex, "codex", "conv-a", "prompt").at("text") == "");
+
+    // The same in check_in: the digest in place of the history, the kept message with it.
+    f.say(f.claude, nullptr, "report number 31");
+    const acm::Window reader = f.open(f.codex, "codex", "conv-b");
+    json page = f.messages.unread(f.codex, f.lobby, 15, &reader);
+    REQUIRE(page.at("digest").at("text") == "DIGEST-1: thirty reports are in; the build is green.");
+    REQUIRE(page.at("messages").size() == 1);
+    REQUIRE(page.at("messages").at(0).at("body") == "report number 31");
+    REQUIRE(page.at("kept_messages").size() == 1);
+    REQUIRE(page.at("kept_messages").at(0).at("context") == "kept");
+    REQUIRE(page.at("skipped_earlier") == 0);
+    // Read is read: nothing of it comes again.
+    page = f.messages.unread(f.codex, f.lobby, 15, &reader);
+    REQUIRE(page.at("messages").empty());
+    REQUIRE_FALSE(page.contains("digest"));
+    // The history is all there for whoever asks for it, with what was done to each message.
+    const json history = f.messages.read(f.codex, {{"conversation_id", f.lobby}, {"after_seq", 0}, {"limit", 10}});
+    REQUIRE(history.at("messages").at(4).at("context") == "dropped");
+    REQUIRE(history.at("messages").at(2).at("context") == "kept");
+
+    // A new digest has to be worth it; restructuring the one that exists, and keep, drop, restore, work any time.
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"summary", "too soon"}}, "coord"); }) ==
+            "DIGEST_NOT_NEEDED");
+    done = f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"summary", "DIGEST-1b: restructured."}, {"upto_seq", 30}, {"restore", {5}}}, "coord");
+    REQUIRE(done.at("digest").at("text") == "DIGEST-1b: restructured.");
+    REQUIRE(done.at("dropped_messages") == 0);
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"drop", {999}}}, "coord"); }) == "NOT_FOUND");
+    // What was dealt with is resolved: out of everybody's context like what was dropped, and marked as settled.
+    f.say(f.claude, nullptr, "REQUEST: rerun table 4");
+    done = f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"resolve", {32}}}, "coord");
+    REQUIRE(done.at("resolved_messages") == 1);
+    REQUIRE_FALSE(f.hook(f.codex, "codex", "conv-c", "prompt").at("text").get<std::string>().contains("rerun table 4"));
+    REQUIRE(f.messages.unread(f.codex, f.lobby, 15, &reader).at("messages").empty());
+    REQUIRE(f.messages.read(f.codex, {{"conversation_id", f.lobby}, {"after_seq", 31}, {"limit", 5}}).at("messages").at(0).at("context") == "resolved");
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"keep", {4}}, {"drop", {4}}}, "coord"); }) ==
+            "INVALID_ARGUMENT");
+
+    // What the operator wrote is not for a session to take out of sight; the operator can.
+    f.messages.send_as_operator({{"conversation_id", f.lobby}, {"body", "operator: figures by Friday"}, {"idempotency_key", "op-1"}});
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"drop", {33}}}, "coord"); }) ==
+            "COMPACT_NOT_ALLOWED");
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"resolve", {33}}}, "coord"); }) ==
+            "COMPACT_NOT_ALLOWED");
+    REQUIRE(f.conversations.compact(nullptr, {{"conversation_id", f.lobby}, {"resolve", {33}}}, "the operator").at("resolved_messages") == 2);
+    // And the operator can keep compacting to the console altogether.
+    acm::store_text_setting(f.database, "agent_compact", "0");
+    REQUIRE(error_code([&] { f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"keep", {4}}}, "coord"); }) ==
+            "COMPACT_DISABLED");
+}
+
+TEST_CASE("a reader that is far behind is given the newest messages, not the history", "[window][compact]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    const acm::Window coordinator = f.open(f.claude, "claude", "conv-coord");
+    const std::string long_text(2000, 'x');
+    for (int i = 1; i <= 70; ++i) {
+        f.say(f.claude, &coordinator, i == 70 ? long_text : "note " + std::to_string(i));
+    }
+    const acm::Window reader = f.open(f.codex, "codex", "thread-r");
+    // No digest yet: the newest fifteen, and a count of what was left out.
+    const json page = f.messages.unread(f.codex, f.lobby, 15, &reader);
+    REQUIRE(page.at("messages").size() == 15);
+    REQUIRE(page.at("messages").at(0).at("body") == "note 56");
+    REQUIRE(page.at("skipped_earlier") == 55);
+    // A long message that is not addressed to the reader comes as an overview.
+    const json last = page.at("messages").at(14);
+    REQUIRE(last.at("cut") == true);
+    REQUIRE(last.at("body").get<std::string>().size() < 600);
+    REQUIRE(last.at("body").get<std::string>().ends_with("[... cut; read_messages has the rest]"));
+    // Much was said and nobody summarized it: the one who wrote most is told that a digest is due.
+    REQUIRE(f.conversations.digest_due(f.claude, f.lobby, &coordinator.window_id) == true);
+    REQUIRE(f.conversations.digest_due(f.codex, f.lobby, &reader.window_id) == false);
+    const acm::Window other = f.open(f.claude, "claude", "conv-other");
+    REQUIRE(f.conversations.digest_due(f.claude, f.lobby, &other.window_id) == false);
+    f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"summary", "seventy notes"}}, "coord");
+    REQUIRE(f.conversations.digest_due(f.claude, f.lobby, &coordinator.window_id) == false);
+}
+
+TEST_CASE("hooks put little in front of a window that is not addressed", "[window][compact]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    const acm::Window coordinator = f.open(f.claude, "claude", "conv-coord");
+    const acm::Window hy = f.open(f.codex, "codex", "thread-hy");
+    const acm::Window nbs = f.open(f.codex, "codex", "thread-nbs");
+    const std::string report = "LONG-REPORT " + std::string(1000, 'r') + " END-OF-REPORT";
+    // A long message for one window: that window gets it in full, the other an overview.
+    f.say(f.claude, &coordinator, report, false, {hy});
+    f.say(f.claude, &coordinator, report + " (to everybody)");
+    const std::string for_hy = f.hook(f.codex, "codex", "thread-hy", "prompt").at("text");
+    REQUIRE(for_hy.contains("END-OF-REPORT"));
+    const std::string for_nbs = f.hook(f.codex, "codex", "thread-nbs", "prompt").at("text");
+    REQUIRE(for_nbs.contains("LONG-REPORT"));
+    REQUIRE_FALSE(for_nbs.contains("END-OF-REPORT"));
+    REQUIRE(for_nbs.size() < 900);
+
+    // A direct conversation belongs to the window that writes in it: Claude's other windows are not shown its traffic.
+    const std::string channel = f.conversations.direct(f.claude, f.codex.session_id).at("conversation_id");
+    f.messages.send(f.claude, {{"conversation_id", channel}, {"body", "codex: status?"}, {"idempotency_key", "d-1"}}, &coordinator);
+    f.messages.send(f.codex, {{"conversation_id", channel}, {"body", "PRIVATE-REPLY for the coordinator"}, {"idempotency_key", "d-2"}}, &hy);
+    REQUIRE_FALSE(f.hook(f.claude, "claude", "conv-elsewhere", "prompt").at("text").get<std::string>().contains("PRIVATE-REPLY"));
+    REQUIRE(f.hook(f.claude, "claude", "conv-coord", "prompt").at("text").get<std::string>().contains("PRIVATE-REPLY"));
+    // The same on the other side: the thread that answered sees what comes next, its sibling does not.
+    f.messages.send(f.claude, {{"conversation_id", channel}, {"body", "FOLLOW-UP for hy"}, {"idempotency_key", "d-3"}}, &coordinator);
+    REQUIRE_FALSE(f.hook(f.codex, "codex", "thread-nbs", "prompt").at("text").get<std::string>().contains("FOLLOW-UP"));
+    REQUIRE(f.hook(f.codex, "codex", "thread-hy", "prompt").at("text").get<std::string>().contains("FOLLOW-UP"));
+
+    // A roster names the windows used last, the caller's own first, and says how many more there are.
+    for (int i = 0; i < 9; ++i) {
+        f.pass(1);
+        f.open(f.codex, "codex", "thread-extra-" + std::to_string(i));
+    }
+    const json listed = f.windows.of_session(f.codex.session_id, &hy, acm::Windows::kRosterWindows);
+    REQUIRE(listed.size() == 8);
+    REQUIRE(listed.at(0).at("is_you") == true);
+    REQUIRE(f.windows.count_of_session(f.codex.session_id) == 11);
+}
+
 TEST_CASE("the operator's shared rules reach every conversation once per version", "[window][rules]") {
     Fixture f;
     acm::store_text_setting(f.database, "shared_rules", "Authorization pages are clicked by Grok Bot.");

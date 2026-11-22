@@ -9,6 +9,7 @@ Replace `<REPO_DIR>` with your local checkout path (for example `C:\Tools\AgentC
 - [Multi-Client Connectivity Check](#multi-client-connectivity-check-claude--codex--antigravity)
 - [Name This Window](#name-this-window-run-once-per-conversation)
 - [Wake Another Window and Hand It Work](#wake-another-window-and-hand-it-work)
+- [Compact the Lobby](#compact-the-lobby-coordinator)
 - [Grok Bot Auto-Trigger Setup](#grok-bot-auto-trigger-setup-run-once)
 - [Grok Bot Routine Worker](#grok-bot-routine-worker)
 - [Grok Bot Health & Routine Check](#grok-bot-health--routine-check)
@@ -54,7 +55,7 @@ Target directory: use the current working directory if it already contains CMake
    node scripts\acm-admin.mjs status (or start via npm run console if stopped).
 
 7. Print a concise summary table covering: Prerequisites / C++ Build / UI Build / Test Results / Registered Clients / Desktop Shortcut / Console URL.
-   Follow the table with the exact manual steps required on my side (restarting desktop clients, trusting the three acm hooks in Codex Settings > Hooks, confirming acm hooks in Antigravity Settings > Customizations > Hooks, and optionally setting up Grok Bot).
+   Follow the table with the exact manual steps required on my side (restarting desktop clients, trusting the four acm hooks in Codex Settings > Hooks, confirming acm hooks in Antigravity Settings > Customizations > Hooks, and optionally setting up Grok Bot).
 ```
 
 ## Standing Instructions for Connected Agents
@@ -67,7 +68,7 @@ Claim tasks with update_task (assignee_session_id: "me") before starting work; s
 Acknowledge directed messages with acknowledge_message after acting on them. Use send_message for channel updates and forward_message to relay messages with attribution.
 Conversations with kind "lobby" reach all linked sessions in the project. Use direct_message with a peer session_id for private 1:1 exchanges.
 Use propose_conversation when a task needs a dedicated conversation; wait for operator approval.
-Reserve urgent: true for time-critical blockers; keep routine replies non-urgent. An urgent message interrupts only whom it names: always give to_windows (or send it to one session) with it; one sent to everybody interrupts nobody. Follow shared_rules from check_in as the operator's standing instructions. When you coordinate others, choose the window yourself from project_sessions[].windows (name, title, cwd, state) and name it; do not ask me which window to use.
+Reserve urgent: true for time-critical blockers; keep routine replies non-urgent. Always pair urgent: true with to_windows (or target a single session) so the intended conversation wakes immediately. Follow shared_rules from check_in as operator standing instructions. When coordinating peers, pick target windows directly from project_sessions[].windows (name, title, cwd, state). When check_in sets digest_due, compact the conversation with compact_conversation before continuing.
 ```
 
 ## Multi-Client Connectivity Check (Claude / Codex / Antigravity)
@@ -79,7 +80,7 @@ Run an end-to-end connectivity self-check for acm (AGORA, the AgentConversationM
 
 Capture the current UTC timestamp as RUN (format yyyyMMdd-HHmmss). Include RUN in every message body and format every idempotency_key as "chk-<your-label>-<RUN>-<step>". Keep urgent false unless explicitly requested in the final line.
 
-1. Session and tools: call get_session and report label, status, and session_id. Count your available acm tools (expected: 23) and verify send_message accepts urgent and to_windows, name_window exists, and bot_request exists. If tools are missing or outdated, note "refresh acm in MCP settings or restart client" and continue. If get_session returns NOT_PAIRED, call request_pairing with your client_kind and retry.
+1. Session and tools: call get_session and report label, status, and session_id. Count your available acm tools (expected: 24) and verify send_message accepts urgent and to_windows, and name_window, compact_conversation, and bot_request exist. If tools are missing or outdated, note "refresh acm in MCP settings or restart client" and continue. If get_session returns NOT_PAIRED, call request_pairing with your client_kind and retry.
 2. Hooks: check whether any context block starting with [ACM] appeared in this turn before your first tool call. Quote its first line, or report "none (no unread messages at prompt time)".
 3. Sync: call check_in. List new messages received since your last check (sender, conversation kind, first 40 characters, urgent flag) and list all peers in project_sessions.
 4. Lobby: post "[Check RUN] <your-label> online" to the conversation where kind is "lobby". Report the assigned sequence number.
@@ -88,7 +89,7 @@ Capture the current UTC timestamp as RUN (format yyyyMMdd-HHmmss). Include RUN i
    - If a check request is already queued or taken, report its request_id, status, and age without creating a duplicate.
    - Otherwise call bot_request with action "ask" and text "Check RUN: reply with PONG and current UTC time". Report request_id and status.
 7. Call check_in once more and report any bot_results and new messages.
-8. Output a compact table covering: Session / Tool Count (23) / Hook Injection / Lobby Receive / Lobby Send / Direct Receive / Direct Send / Bot Request. Mark each item Pass, Fail (reason), or Skipped, followed by one line stating any remaining manual action (or "None").
+8. Output a compact table covering: Session / Tool Count (24) / Hook Injection / Lobby Receive / Lobby Send / Direct Receive / Direct Send / Bot Request. Mark each item Pass, Fail (reason), or Skipped, followed by one line stating any remaining manual action (or "None").
 
 Constraints:
 - Send each message once. On RATE_LIMITED, wait retry_after_seconds and retry once; duplicate_suppressed: true counts as success.
@@ -101,28 +102,36 @@ If a session label is written after the colon above, send one direct_message to 
 
 ## Name This Window (Run Once per Conversation)
 
-Paste into any Claude, Codex, or Antigravity conversation that should be reachable by name. Replace `ROLE` with a short name without spaces (for example `backend`, `docs`, `paper-review`).
+Paste into any Claude, Codex, or Antigravity conversation that should be addressable by name. Replace `ROLE` with a short handle without spaces (for example `backend`, `docs`, `paper-review`).
 
 ```text
-Call the acm check_in tool and report the "window" it returns. Then call name_window with name "ROLE" so that other
-sessions can address this conversation. From now on, when a message marked [ACM] arrives that is addressed to this
-window, treat it as a request from a colleague: do what it asks as far as my instructions for this conversation
-allow, then report the outcome with send_message (to_windows set to the window that asked).
+Call acm check_in and report the returned "window" object. Then call name_window with name "ROLE" so peers can address this conversation directly. Whenever an [ACM] message arrives addressed to this window, execute the request within the scope of this conversation's instructions and report the outcome via send_message with to_windows set to the requesting window.
 ```
 
 ## Wake Another Window and Hand It Work
 
-Paste into the conversation that hands out the work. Replace `TARGET` with the window's name and describe the work.
+Paste into a coordinating conversation to delegate work to a named window. Replace `TARGET` with the window handle and describe the task.
 
 ```text
-Call the acm check_in tool and look at project_sessions[].windows. Confirm that a window named "TARGET" exists and
-report its state (idle, busy, or watching). Then send it one message with send_message in the lobby:
+Call acm check_in and inspect project_sessions[].windows. Confirm that window "TARGET" exists and report its state (idle, busy, or watching). Send one lobby message via send_message:
 - to_windows: ["TARGET"]
 - urgent: true
-- body: a complete, self-contained request: what to do, in which directory or project, what "done" looks like, and
-  that it should report back with send_message addressed to this window.
-Do not send a second urgent message. At your next turn, call check_in and report what TARGET answered. If TARGET does
-not exist, list the windows that do and stop.
+- body: a complete, self-contained request stating the task, target directory or project, acceptance criteria, and instructions to report back via send_message addressed to this window.
+Send a single urgent message only. On your next turn, call check_in and summarize TARGET's reply. If TARGET is missing, list available windows and stop.
+```
+
+## Compact the Lobby (Coordinator)
+
+Paste into the coordinating conversation when a shared channel has grown long.
+
+```text
+Call acm check_in, then call read_messages on the lobby starting after the last digest (or from sequence 0 if no digest exists). Run compact_conversation once for the lobby:
+- summary: concise structured state covering decisions, completed milestones, open items, ownership, and key IDs, paths, or metrics. Carry forward still-active facts from the prior digest since the new digest replaces it.
+- keep: sequence numbers of messages that must stay visible in full (specifications, operator decisions).
+- resolve: sequence numbers of completed and confirmed requests.
+- drop: sequence numbers of routine noise or superseded reports.
+- close_tasks: board numbers or task IDs of settled tasks.
+Preserve all operator console messages untouched. Continue resolving settled exchanges as work finishes and compact again whenever check_in flags digest_due.
 ```
 
 ## Grok Bot Auto-Trigger Setup (Run Once)
@@ -219,7 +228,7 @@ node <REPO_DIR>\src\mcp\cli.mjs --client grok --ascii
    - On "temporarily unreachable" or launch failure, wait 20 seconds and retry up to 5 times; if still unreachable, mark Host Reachable as Fail and jump to step 5.
    - Record result.hook (null or present), enabled, last_status, last_detail, last_ok_at, queued_requests, and host_seen_at.
 
-2. CLI entry: run ACM tools and record tool count (expected: 23). Run ACM call get_session and record status (expected: active).
+2. CLI entry: run ACM tools and record tool count (expected: 24). Run ACM call get_session and record status (expected: active).
 
 3. Routines: inspect your routines list.
    - Verify "ACM Worker" exists, is enabled, and carries a Webhook trigger.
@@ -230,7 +239,7 @@ node <REPO_DIR>\src\mcp\cli.mjs --client grok --ascii
 4. Round-trip wake test: if result.hook is non-null, run ACM wake test --wait 180 (run no other ACM commands while waiting) and record signal, run_reached_this_machine, and verdict. If result.hook is null, mark "Not registered".
 
 5. Output a summary table covering:
-   Host Reachable / CLI Tools (23) / Session Status / Wake Hook Registered / Webhook Routine / Schedule Routine / Latest Run / Round-Trip Wake Test / Queued Requests.
+   Host Reachable / CLI Tools (24) / Session Status / Wake Hook Registered / Webhook Routine / Schedule Routine / Latest Run / Round-Trip Wake Test / Queued Requests.
    End with one line stating the minimum required user action, or "No action needed" if all items are healthy.
 
 Constraints:

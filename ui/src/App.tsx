@@ -4,6 +4,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { ApiError, createApi, followEvents, type Api, type Bootstrap, type EventRecord } from './api';
 import { AgentsView } from './Agents';
 import { EventsView } from './Events';
+import { ManageView } from './Manage';
+import { OverviewView } from './Overview';
 import { SettingsView } from './Settings';
 import { ActionButton, Icon, Pill } from './format';
 import { useI18n, type Messages } from './i18n';
@@ -16,7 +18,7 @@ const TOAST_LIFE = { ok: 3200, danger: 7000 };
 
 type Connection = 'connecting' | 'live' | 'reconnecting';
 type Theme = 'system' | 'light' | 'dark';
-type View = 'workspace' | 'agents' | 'events' | 'settings';
+type View = 'workspace' | 'overview' | 'manage' | 'agents' | 'events' | 'settings';
 
 interface Toast {
   id: number;
@@ -325,6 +327,8 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
   const state: ConsoleState = { api, data, events, connection, refresh, notify, run, requestRestart: () => setConfirmRestart(true) };
   const tabs: { id: View; label: string; icon: string; badge?: number }[] = [
     { id: 'workspace', label: t.nav.workspace, icon: 'chat' },
+    { id: 'overview', label: t.nav.overview, icon: 'chart' },
+    { id: 'manage', label: t.nav.manage, icon: 'checks' },
     { id: 'agents', label: t.nav.agents, icon: 'agents', badge: pending },
     { id: 'events', label: t.nav.events, icon: 'pulse' },
     { id: 'settings', label: t.nav.settings, icon: 'sliders' },
@@ -376,6 +380,8 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
               </div>
             )}
             {view === 'workspace' && <WorkspaceView onOpenAgents={() => setView('agents')} />}
+            {view === 'overview' && <OverviewView />}
+            {view === 'manage' && <ManageView />}
             {view === 'agents' && <AgentsView />}
             {view === 'events' && <EventsView />}
             {view === 'settings' && <SettingsView />}

@@ -368,6 +368,14 @@ private:
                 return ok(service_.events_after(after, std::min<std::int64_t>(
                                                            integer_parameter(request, "limit", 200), 1000)));
             }
+            // Counts for the console's overview charts.
+            if (resource == "stats" && method == drogon::Get) {
+                json args = json::object();
+                if (!request->getParameter("days").empty()) {
+                    args["days"] = integer_parameter(request, "days", 7);
+                }
+                return ok(service_.admin("stats", "", args));
+            }
             if (resource == "sessions" && method == drogon::Get) {
                 return ok(service_.admin("list_sessions", "", json::object()));
             }
@@ -465,6 +473,21 @@ private:
         }
         if (resource == "windows" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("rename_window", path[3], parse_body(request)));
+        }
+        // What compacting did to a conversation so far.
+        if (resource == "conversations" && path.size() == 5 && is(4, "compactions") && method == drogon::Get) {
+            return ok(service_.admin("compactions", path[3], json::object()));
+        }
+        // Every digest a conversation was given, and putting one of them back in use.
+        if (resource == "conversations" && path.size() == 5 && is(4, "digests") && method == drogon::Get) {
+            return ok(service_.admin("digests", path[3], json::object()));
+        }
+        if (resource == "conversations" && path.size() == 5 && is(4, "digest") && method == drogon::Put) {
+            return ok(service_.admin("use_digest", path[3], parse_body(request)));
+        }
+        // The operator compacts a conversation: digest, messages to keep, messages to drop.
+        if (resource == "conversations" && path.size() == 5 && is(4, "compact") && method == drogon::Post) {
+            return ok(service_.admin("compact_conversation", path[3], parse_body(request)));
         }
         // Conversations the gateway found on a client's own record.
         if (resource == "windows" && path.size() == 4 && is(3, "import") && method == drogon::Post) {

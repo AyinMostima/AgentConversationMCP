@@ -82,7 +82,11 @@ public:
     std::vector<Window> lookup(std::string_view project_id, const std::vector<std::string>& handles);
 
     // Live windows of one session, for rosters: {window_id, name, title, state, last_active_at, cwd, is_you, imported}.
-    json of_session(std::string_view session_id, const Window* self);
+    // At most `limit` of them, the most recently used first; the caller's own is always among them.
+    static constexpr std::int64_t kRosterWindows = 8;
+    json of_session(std::string_view session_id, const Window* self, std::int64_t limit = 40);
+    // How many live windows the session has in all.
+    std::int64_t count_of_session(std::string_view session_id);
 
     // Operator view of one window.
     json view(std::string_view window_id);

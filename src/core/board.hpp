@@ -40,6 +40,13 @@ public:
     // Every task of a conversation, open ones first, in board order.
     json tasks(std::string_view conversation_id, bool include_closed);
 
+    // Closes settled tasks of a conversation in one go: `handles` holds task numbers
+    // (as on the board) or task ids. Each becomes done with `note`; one that is
+    // closed already is left as it is. `actor` null is the operator. Returns how
+    // many were closed.
+    std::int64_t close(const Session* actor, std::string_view conversation_id, const json& handles,
+                       const std::string& note);
+
 private:
     json create(const Session* actor, std::string_view conversation_id, std::string_view project_id,
                 const json& args);

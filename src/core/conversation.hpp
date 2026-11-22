@@ -58,6 +58,52 @@ public:
 
     // Operator views.
     json get(std::string_view conversation_id);
+
+    // A digest needs this many messages since the one before it; and it is due
+    // (check_in says so to the member who wrote most) after this many.
+    static constexpr std::int64_t kDigestMinMessages = 20;
+    static constexpr std::int64_t kDigestDueMessages = 60;
+
+    // {conversation_id, summary?, upto_seq?, keep?, drop?, resolve?, restore?}: decides what of
+    // a conversation is still read into anybody's context.
+    //   summary  the digest: what was said up to message `upto_seq` (default: the
+    //            last one), restructured as the writer sees fit. Readers that are
+    //            behind get it in place of those messages. A new range needs
+    //            kDigestMinMessages messages since the previous digest
+    //            (DIGEST_NOT_NEEDED); rewriting the digest of the same range does not.
+    //   keep     sequence numbers of messages that stay in front of readers in full
+    //            although the digest covers their time.
+    //   drop     sequence numbers of messages that are no longer put in front of
+    //            anybody (noise, superseded reports). They stay in the history.
+    //   resolve  sequence numbers of messages that were dealt with (a request that is
+    //            done, a question that was answered): like drop, and marked as
+    //            resolved rather than as noise.
+    //   restore  sequence numbers that are neither kept, dropped nor resolved any more.
+    // `session` is the member doing it (null: the operator at the console). A
+    // member can neither drop nor resolve what the operator wrote. `by` names the writer. Fails
+    // COMPACT_DISABLED when the operator switched this off for agents.
+    json compact(const Session* session, const json& args, const std::string& by);
+
+    // What compacting did to a conversation, newest first: [{at, by, upto_seq,
+    // digest_bytes, kept, dropped, resolved, restored}]. From the event log; it
+    // holds no text of the conversation.
+    json compactions(std::string_view conversation_id);
+
+    // {text, upto_seq, written_at, by}, or null when the conversation has none.
+    json digest(std::string_view conversation_id);
+
+    // Every digest the conversation was given, newest first: [{digest_id, text,
+    // upto_seq, written_at, by, current}]. `current` marks the one readers get.
+    json digests(std::string_view conversation_id);
+
+    // The operator puts digest `digest_id` of this conversation in use in place of
+    // the current one. Readers that are behind are shown it once, like a new one.
+    // Fails NOT_FOUND for a digest of another conversation.
+    json use_digest(std::string_view conversation_id, std::int64_t digest_id);
+
+    // Whether `session` (and, when known, its window) is the one to write the
+    // next digest: enough was said since the last one, and it wrote most of it.
+    bool digest_due(const Session& session, std::string_view conversation_id, const std::string* window_id);
     json list_all();
     json list_projects();
 

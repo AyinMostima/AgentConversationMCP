@@ -90,7 +90,7 @@ describe('windows', { concurrency: false }, () => {
   });
 
   it('tells the conversations of one application apart and lets each name itself', async () => {
-    assert.equal((await codex.listTools()).tools.length, 23);
+    assert.equal((await codex.listTools()).tools.length, 24);
     const first = (await call(codex, 'check_in', {}, hy)).result;
     const second = (await call(codex, 'check_in', {}, nbs)).result;
     lobby = first.conversations.find((entry) => entry.kind === 'lobby').conversation_id;
@@ -184,6 +184,6 @@ describe('windows', { concurrency: false }, () => {
     const renamed = await service.admin('PUT', `/api/v1/windows/${entry.windows.find((window) => window.name === 'hy').window_id}`, { name: 'hybrid' });
     assert.equal(renamed.name, 'hybrid');
     assert.equal((await call(codex, 'check_in', {}, hy)).result.window.name, 'hybrid');
-    assert.equal(state.tool_contract, 3);
+    assert.equal(state.tool_contract, 5);
   });
 });

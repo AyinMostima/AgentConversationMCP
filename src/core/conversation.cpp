@@ -191,6 +191,214 @@ json Conversations::get(std::string_view conversation_id) {
     return conversation_row(conversation_id);
 }
 
+json Conversations::compact(const Session* session, const json& args, const std::string& by) {
+    const auto conversation_id = require_string(args, "conversation_id", 96);
+    const auto summary = optional_string(args, "summary", 6000);
+    if (session != nullptr) {
+        require_writer(*session, conversation_id);
+        if (text_setting(database_, "agent_compact").value_or("1") != "1") {
+            fail("COMPACT_DISABLED", "the operator has switched off compacting by agents; it is done at the console");
+        }
+    }
+    const auto numbers = [&](const char* field) {
+        std::vector<std::int64_t> list;
+        if (args.contains(field)) {
+            if (!args.at(field).is_array() || args.at(field).size() > 200) {
+                fail("INVALID_ARGUMENT", std::format("{} must be a list of at most 200 sequence numbers", field));
+            }
+            for (const auto& entry : args.at(field)) {
+                if (!entry.is_number_integer() || entry.get<std::int64_t>() < 1) {
+                    fail("INVALID_ARGUMENT", std::format("{} must hold sequence numbers", field));
+                }
+                list.push_back(entry.get<std::int64_t>());
+            }
+        }
+        return list;
+    };
+    const auto keep = numbers("keep");
+    const auto drop = numbers("drop");
+    const auto resolve = numbers("resolve");
+    const auto restore = numbers("restore");
+    if ((!summary || summary->empty()) && keep.empty() && drop.empty() && resolve.empty() && restore.empty()) {
+        fail("INVALID_ARGUMENT", "give a summary, or sequence numbers to keep, drop, resolve or restore");
+    }
+    for (const auto seq : keep) {
+        if (std::ranges::find(drop, seq) != drop.end() || std::ranges::find(resolve, seq) != resolve.end()) {
+            fail("INVALID_ARGUMENT", std::format("message {} cannot be both kept and taken out", seq));
+        }
+    }
+    return database_.transaction([&] {
+        Statement row = database_.query("SELECT next_seq - 1, digest_seq, project_id FROM conversations WHERE conversation_id = ?",
+                                        conversation_id);
+        if (!row.step()) {
+            fail("NOT_FOUND", std::format("conversation {} does not exist", conversation_id));
+        }
+        const std::int64_t last = row.integer(0);
+        const std::int64_t previous = row.integer(1);
+        const auto project_id = row.text(2);
+        std::int64_t upto = previous;
+        if (summary && !summary->empty()) {
+            upto = optional_integer(args, "upto_seq", last, 1, INT64_MAX);
+            if (upto > last) {
+                fail("INVALID_ARGUMENT", std::format("upto_seq {} is beyond the last message ({})", upto, last));
+            }
+            if (upto < previous) {
+                fail("INVALID_ARGUMENT", std::format("the digest already covers up to message {}; it cannot go back", previous));
+            }
+            // The same range written again is a restructuring; a new range has to be worth a digest.
+            if (upto != previous && upto - previous < kDigestMinMessages) {
+                fail("DIGEST_NOT_NEEDED",
+                     std::format("the last digest covers this conversation up to message {}; a new one needs at least "
+                                 "{} messages after that (keep, drop and restore work at any time)",
+                                 previous, kDigestMinMessages),
+                     {{"digest_upto_seq", previous}, {"last_seq", last}});
+            }
+            const auto written = to_rfc3339(clock_());
+            database_.execute(
+                "UPDATE conversations SET digest = ?, digest_seq = ?, digest_at = ?, digest_by = ? WHERE conversation_id = ?",
+                *summary, upto, written, by, conversation_id);
+            // Kept beside the earlier ones, so that the operator can compare them and go back.
+            database_.execute(
+                "INSERT INTO digests (conversation_id, text, upto_seq, written_at, written_by) VALUES (?, ?, ?, ?, ?)",
+                conversation_id, *summary, upto, written, by);
+        }
+        const auto mark = [&](const std::vector<std::int64_t>& list, std::int64_t value) {
+            for (const auto seq : list) {
+                Statement found = database_.query("SELECT sender_kind FROM messages WHERE conversation_id = ? AND seq = ?",
+                                                  conversation_id, seq);
+                if (!found.step()) {
+                    fail("NOT_FOUND", std::format("this conversation has no message {}", seq), {{"sequence", seq}});
+                }
+                // What the person who runs these sessions wrote is not for a session to take out of sight.
+                if (value < 0 && session != nullptr && found.text(0) == "operator") {
+                    fail("COMPACT_NOT_ALLOWED",
+                         std::format("message {} was written by the operator; only the operator takes it out of sight", seq),
+                         {{"sequence", seq}});
+                }
+                database_.execute("UPDATE messages SET context = ? WHERE conversation_id = ? AND seq = ?", value,
+                                  conversation_id, seq);
+            }
+        };
+        mark(keep, 1);
+        mark(drop, -1);
+        mark(resolve, -2);
+        mark(restore, 0);
+        // The event says what was done and by whom, not what the digest says.
+        events_.append("conversation.compacted",
+                       {.project_id = project_id,
+                        .conversation_id = conversation_id,
+                        .actor_id = session != nullptr ? std::optional<std::string>(session->session_id) : std::nullopt},
+                       conversation_id,
+                       {{"upto_seq", upto},
+                        {"digest_bytes", summary ? summary->size() : 0},
+                        {"kept", keep.size()},
+                        {"dropped", drop.size()},
+                        {"resolved", resolve.size()},
+                        {"restored", restore.size()},
+                        {"by", by}});
+        Statement counts = database_.query(
+            "SELECT COALESCE(SUM(context = 1), 0), COALESCE(SUM(context = -1), 0), COALESCE(SUM(context = -2), 0) "
+            "FROM messages WHERE conversation_id = ?",
+            conversation_id);
+        counts.step();
+        return json{{"conversation_id", conversation_id},
+                    {"digest", digest(conversation_id)},
+                    {"kept_messages", counts.integer(0)},
+                    {"dropped_messages", counts.integer(1)},
+                    {"resolved_messages", counts.integer(2)}};
+    });
+}
+
+json Conversations::compactions(std::string_view conversation_id) {
+    json list = json::array();
+    Statement rows = database_.query(
+        "SELECT occurred_at, payload FROM events WHERE event_type = 'conversation.compacted' AND entity_id = ? "
+        "ORDER BY event_id DESC LIMIT 40",
+        conversation_id);
+    while (rows.step()) {
+        json entry = json::parse(rows.text(1), nullptr, false);
+        if (!entry.is_object()) {
+            continue;
+        }
+        entry["at"] = rows.text(0);
+        list.push_back(std::move(entry));
+    }
+    return list;
+}
+
+json Conversations::digest(std::string_view conversation_id) {
+    Statement row = database_.query(
+        "SELECT digest, digest_seq, digest_at, digest_by FROM conversations WHERE conversation_id = ? AND digest IS NOT NULL",
+        conversation_id);
+    if (!row.step()) {
+        return nullptr;
+    }
+    return {{"text", row.text(0)},
+            {"upto_seq", row.integer(1)},
+            {"written_at", row.optional_text(2).value_or("")},
+            {"by", row.optional_text(3).value_or("")}};
+}
+
+json Conversations::digests(std::string_view conversation_id) {
+    json list = json::array();
+    // The one in use is the latest that matches the conversation's own digest.
+    Statement rows = database_.query(
+        "SELECT d.digest_id, d.text, d.upto_seq, d.written_at, d.written_by, "
+        "d.digest_id = (SELECT MAX(e.digest_id) FROM digests e JOIN conversations c ON c.conversation_id = e.conversation_id "
+        "               WHERE e.conversation_id = d.conversation_id AND e.text = c.digest AND e.upto_seq = c.digest_seq) "
+        "FROM digests d WHERE d.conversation_id = ? ORDER BY d.digest_id DESC LIMIT 100",
+        conversation_id);
+    while (rows.step()) {
+        list.push_back({{"digest_id", rows.integer(0)},
+                        {"text", rows.text(1)},
+                        {"upto_seq", rows.integer(2)},
+                        {"written_at", rows.text(3)},
+                        {"by", rows.optional_text(4).value_or("")},
+                        {"current", rows.integer(5) != 0}});
+    }
+    return list;
+}
+
+json Conversations::use_digest(std::string_view conversation_id, std::int64_t digest_id) {
+    return database_.transaction([&] {
+        Statement row = database_.query(
+            "SELECT d.text, d.upto_seq, d.written_at, d.written_by, c.project_id, c.next_seq - 1 FROM digests d "
+            "JOIN conversations c ON c.conversation_id = d.conversation_id WHERE d.digest_id = ? AND d.conversation_id = ?",
+            digest_id, conversation_id);
+        if (!row.step()) {
+            fail("NOT_FOUND", std::format("conversation {} has no digest {}", conversation_id, digest_id));
+        }
+        // Messages may have been cleared since: a digest never claims more than there is.
+        const std::int64_t upto = std::min(row.integer(1), row.integer(5));
+        database_.execute(
+            "UPDATE conversations SET digest = ?, digest_seq = ?, digest_at = ?, digest_by = ? WHERE conversation_id = ?",
+            row.text(0), upto, row.text(2), row.optional_text(3), conversation_id);
+        // Readers that are behind are given this one once, as they would a new digest.
+        database_.execute("UPDATE window_cursors SET digest_seen = 0 WHERE conversation_id = ?", conversation_id);
+        events_.append("conversation.digest_chosen", {.project_id = row.text(4), .conversation_id = std::string(conversation_id)},
+                       conversation_id, {{"digest_id", digest_id}, {"upto_seq", upto}});
+        return json{{"conversation_id", conversation_id}, {"digest", digest(conversation_id)}, {"digests", digests(conversation_id)}};
+    });
+}
+
+bool Conversations::digest_due(const Session& session, std::string_view conversation_id, const std::string* window_id) {
+    Statement row = database_.query("SELECT next_seq - 1, digest_seq FROM conversations WHERE conversation_id = ?",
+                                    conversation_id);
+    if (!row.step() || row.integer(0) - row.integer(1) < kDigestDueMessages) {
+        return false;
+    }
+    // One member writes it, not each of them: the one that wrote most since the last digest.
+    Statement top = database_.query(
+        "SELECT sender_session_id, author_window_id FROM messages WHERE conversation_id = ? AND seq > ? "
+        "AND sender_session_id IS NOT NULL GROUP BY sender_session_id, author_window_id ORDER BY COUNT(*) DESC LIMIT 1",
+        conversation_id, row.integer(1));
+    if (!top.step() || top.text(0) != session.session_id) {
+        return false;
+    }
+    const auto author = top.optional_text(1);
+    return !author || window_id == nullptr || *author == *window_id;
+}
+
 json Conversations::update(std::string_view conversation_id, const json& args) {
     if (!args.is_object() || args.empty()) {
         fail("INVALID_ARGUMENT", "give title, task_code, purpose and/or archived to change");
@@ -510,6 +718,15 @@ json Conversations::conversation_row(std::string_view conversation_id) {
     view["message_count"] = volume.integer(0);
     view["last_message_at"] = nullable(volume.optional_text(1));
     view["open_tasks"] = volume.integer(2);
+    // What a reader that is behind gets in place of the history, and how many messages
+    // compacting kept in front of readers or took out of what is read into a context.
+    view["digest"] = digest(conversation_id);
+    Statement compacted = database_.query(
+        "SELECT COALESCE(SUM(context = 1), 0), COALESCE(SUM(context = -1), 0), COALESCE(SUM(context = -2), 0) "
+        "FROM messages WHERE conversation_id = ?",
+        conversation_id);
+    compacted.step();
+    view["context_counts"] = {{"kept", compacted.integer(0)}, {"dropped", compacted.integer(1)}, {"resolved", compacted.integer(2)}};
     if (view.at("kind") == "direct") {
         // The two sessions of a direct conversation that are currently out of it,
         // and why, so the operator can see and restore them.

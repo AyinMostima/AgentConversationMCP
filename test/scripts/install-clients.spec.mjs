@@ -182,6 +182,9 @@ describe('client installer', { concurrency: false }, () => {
     assert.ok(!/[\\"']/.test(line), `no backslash and no quote in: ${line}`);
     assert.match(line, / --client codex --event stop /);
     assert.equal(codex.hooks.SessionStart[0].matcher, 'startup|resume');
+    // After every tool call: what is urgent reaches a turn that is under way. It has to be quick.
+    assert.match(codex.hooks.PostToolUse[0].hooks[0].command, / --client codex --event tool /);
+    assert.equal(codex.hooks.PostToolUse[0].hooks[0].timeout, 5);
     const agy = JSON.parse(readFileSync(agyHooks, 'utf8'));
     assert.ok(!readFileSync(agyHooks, 'utf8').startsWith('\uFEFF'), 'written without a byte order mark');
     assert.deepEqual(Object.keys(agy), ['my-linter-hook', 'acm']);

@@ -468,6 +468,72 @@ constexpr const char* kMigrations[] = {
     ALTER TABLE deliveries ADD COLUMN stand_in INTEGER NOT NULL DEFAULT 0;
     UPDATE deliveries SET stand_in = 1 WHERE route = 'command' AND from_rowid IS NULL AND detail LIKE '%stand-in%';
     )sql",
+    // 025 - a digest: what a conversation said up to some message, written by one of
+    // its members. A reader that is behind gets the digest in place of the messages
+    // it covers, so that catching up does not cost a context full of history. Each
+    // window notes which digest it was shown.
+    R"sql(
+    ALTER TABLE conversations ADD COLUMN digest TEXT;
+    ALTER TABLE conversations ADD COLUMN digest_seq INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE conversations ADD COLUMN digest_at TEXT;
+    ALTER TABLE conversations ADD COLUMN digest_by TEXT;
+    ALTER TABLE window_cursors ADD COLUMN digest_seen INTEGER NOT NULL DEFAULT 0;
+    )sql",
+    // 026 - compacting: what of a conversation is read into a reader's context. A
+    // message can be kept (1: it stays in front of readers although a digest covers
+    // its time), dropped (-1: it is no longer put in front of anybody; it stays in
+    // the history) or resolved (-2: the same, because it was dealt with). 0 is the
+    // ordinary case.
+    R"sql(
+    ALTER TABLE messages ADD COLUMN context INTEGER NOT NULL DEFAULT 0;
+    )sql",
+    // 027 - a delivery in the middle of a turn, after a tool call of the
+    // conversation ("tool"). The check on the route cannot be changed in place,
+    // so the table is rebuilt once more.
+    R"sql(
+    CREATE TABLE deliveries_next (
+        delivery_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id   TEXT NOT NULL REFERENCES agent_sessions(session_id),
+        created_at   TEXT NOT NULL,
+        route        TEXT NOT NULL CHECK (route IN ('start', 'prompt', 'stop', 'watch', 'command', 'tool')),
+        status       TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed', 'skipped')),
+        upto_rowid   INTEGER NOT NULL,
+        messages     INTEGER NOT NULL,
+        urgent       INTEGER NOT NULL,
+        detail       TEXT,
+        window_id    TEXT,
+        from_rowid   INTEGER,
+        unconfirmed  INTEGER,
+        attempt      INTEGER NOT NULL DEFAULT 0,
+        stand_in     INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO deliveries_next (delivery_id, session_id, created_at, route, status, upto_rowid, messages, urgent, detail,
+                                 window_id, from_rowid, unconfirmed, attempt, stand_in)
+        SELECT delivery_id, session_id, created_at, route, status, upto_rowid, messages, urgent, detail,
+               window_id, from_rowid, unconfirmed, attempt, stand_in
+        FROM deliveries;
+    DROP TABLE deliveries;
+    ALTER TABLE deliveries_next RENAME TO deliveries;
+    CREATE INDEX deliveries_by_session ON deliveries (session_id, created_at);
+    CREATE INDEX deliveries_by_window ON deliveries (window_id, route);
+    )sql",
+    // 028 - every digest a conversation was given, not only the one in use. The
+    // conversation's own digest columns stay the one readers get; the operator can
+    // put an earlier one back in their place.
+    R"sql(
+    CREATE TABLE digests (
+        digest_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id  TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        text             TEXT NOT NULL,
+        upto_seq         INTEGER NOT NULL,
+        written_at       TEXT NOT NULL,
+        written_by       TEXT
+    );
+    CREATE INDEX digests_by_conversation ON digests (conversation_id, digest_id);
+    INSERT INTO digests (conversation_id, text, upto_seq, written_at, written_by)
+        SELECT conversation_id, digest, digest_seq, COALESCE(digest_at, ''), digest_by
+        FROM conversations WHERE digest IS NOT NULL;
+    )sql",
 };
 
 }  // namespace

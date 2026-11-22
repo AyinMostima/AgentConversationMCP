@@ -379,6 +379,38 @@ TEST_CASE("a stand-in acts for a window that cannot be started itself", "[delive
     REQUIRE(prompt.at("text").get<std::string>().contains("build the figures"));
 }
 
+TEST_CASE("an urgent message reaches a conversation in the middle of its turn", "[delivery][urgent]") {
+    Fixture f;
+    const auto codex_hook = [&](const std::string& event) {
+        return f.hook(f.codex, event, {{"client", "codex"}, {"client_session", "thread-1"}});
+    };
+    codex_hook("prompt");
+    f.say(f.claude, "an ordinary note");
+    // Nothing urgent: a tool call adds nothing, however many there are.
+    REQUIRE(codex_hook("tool").at("count") == 0);
+    f.say(f.claude, "stop: the input file is wrong", true);
+    // The next tool call of the running turn carries it to the model.
+    const json mid = codex_hook("tool");
+    REQUIRE(mid.at("count") == 1);
+    REQUIRE(mid.at("text").get<std::string>().contains("Urgent: 1 message(s)"));
+    REQUIRE(mid.at("text").get<std::string>().contains("the input file is wrong"));
+    REQUIRE_FALSE(mid.at("text").get<std::string>().contains("an ordinary note"));
+    // Once: not with the tool calls after it, not at the end of the turn, not with the next prompt.
+    REQUIRE(codex_hook("tool").at("count") == 0);
+    REQUIRE(codex_hook("stop").at("count") == 0);
+    const json next = codex_hook("prompt");
+    REQUIRE(next.at("count") == 1);
+    REQUIRE(next.at("text").get<std::string>().contains("an ordinary note"));
+    // A conversation that calls tools is in a turn: it is not started from outside meanwhile.
+    codex_hook("tool");
+    f.pass(acm::Delivery::kSettleSeconds + 1);
+    f.say(f.claude, "one more urgent thing", true);
+    REQUIRE(f.delivery.claim({{"clients", {"codex"}}}).at("jobs").empty());
+    const json view = f.delivery.list().at(0);
+    REQUIRE(view.at("event") == "prompt");
+    REQUIRE(view.at("last_urgent").at("route") == "tool");
+}
+
 TEST_CASE("urgent deliveries to one session are capped per window", "[delivery][urgent][limits]") {
     Fixture f;
     acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});

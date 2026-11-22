@@ -109,6 +109,8 @@ const PATHS: Record<string, string> = {
   alert: 'M12 8.5v4.5m0 3.5v.01M10.3 4.2 3 17a2 2 0 0 0 1.7 3h14.6A2 2 0 0 0 21 17L13.7 4.2a2 2 0 0 0-3.4 0z',
   ban: 'M5.6 5.6l12.8 12.8M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',
   plus: 'M12 5v14M5 12h14',
+  minus: 'M5 12h14',
+  chart: 'M4 20V4M4 20h16M8 16v-5M12 16V8M16 16v-3M20 16v-8',
   send: 'M4.5 12 20 4.5 15.5 20l-3.6-6.2zm7.4 1.8L20 4.5',
   copy: 'M9 9h10v11H9zM5 15V4h10',
   panel: 'M4 5h16v14H4zM14.5 5v14',

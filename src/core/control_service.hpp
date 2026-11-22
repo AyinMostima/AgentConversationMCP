@@ -53,14 +53,20 @@ public:
     // Version of the tool contract: raised whenever a tool is added or removed or
     // the parameters of one change. Must equal TOOL_CONTRACT in src/mcp/tools.mjs;
     // a bridge that reports another number was started before the change.
-    static constexpr int kToolContract = 3;
+    static constexpr int kToolContract = 5;
     int schema_version();
 
 private:
     // One call that brings a session up to date: goals, task boards and unread messages.
     json check_in(const Session& session, const json& args, const Window* window);
     // The sessions a caller can address, each with its windows.
-    json roster(const Session& session, const Window* window);
+    json roster(const Session& session, const Window* window, bool all_windows = false);
+    // Compacting a conversation: its messages (Conversations::compact) and its board (close_tasks).
+    json compact(const Session* session, const json& args, const std::string& by);
+    // Activity of the last `days` days for the console's overview: messages per
+    // hour (one day) or per day, and who, where, how urgent messages were handed
+    // over, and the boards as they stand. Counts only, never text.
+    json stats(std::int64_t days);
     // The windows named in args.to_windows, resolved within the caller's project.
     std::vector<Window> target_windows(const Session& session, const json& args);
     json settings_view();

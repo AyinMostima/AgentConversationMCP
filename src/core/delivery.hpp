@@ -54,6 +54,10 @@ public:
     // How many messages one hook run lists, and how much of each.
     static constexpr std::int64_t kMaxListed = 8;
     static constexpr std::size_t kBodyBytes = 1200;
+    // A message that is not addressed to the window it is shown to: enough to see
+    // what it is about. check_in and read_messages have the rest.
+    static constexpr std::size_t kBriefBytes = 300;
+    static constexpr std::size_t kDigestBytes = 3000;
     static constexpr std::size_t kUrgentBodyBytes = 4000;
     // Urgent deliveries (stop, watch, command) a window gets within kWindowSeconds.
     static constexpr std::int64_t kMaxUrgentDeliveries = 6;

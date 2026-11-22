@@ -90,7 +90,7 @@ describe('MCP stdio bridge', { concurrency: false }, () => {
   it('exposes the same tools and reaches the same store as an HTTP client', async () => {
     const stdio = await connectStdio(['--no-autostart'], { ACM_SESSION_TOKEN: tokens.stdio });
     const names = (await stdio.listTools()).tools.map((tool) => tool.name).sort();
-    assert.equal(names.length, 23);
+    assert.equal(names.length, 24);
     assert.ok(names.includes('check_in') && names.includes('update_task') && names.includes('direct_message'));
     assert.ok(names.includes('send_message') && names.includes('get_inbox'));
     assert.equal(stdio.getServerVersion().name, 'agent-conversation-mcp');

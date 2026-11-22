@@ -1,7 +1,7 @@
 // Workspace view: project/conversation sidebar, message timeline, task board
 // toggle, operator composer, and member permissions inspector.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Conversation, Member, Message, Session } from './api';
+import type { Compaction, Conversation, DigestEntry, Member, Message, Session } from './api';
 import { Dialog, useConsole } from './App';
 import { BoardView, GoalLine, useTasks } from './Board';
 import { GrokPrefillButton } from './Grok';
@@ -198,7 +198,172 @@ function MessageDetails({ message, nameOf }: { message: Message; nameOf: (sessio
       <div className="row-actions">
         <GrokPrefillButton text={t.workspace.grokPrefillText(senderName(message, t), message.sender.label, message.body)} />
       </div>
+      <ContextActions message={message} />
     </div>
+  );
+}
+
+/** What of this message is read into a session's context: the operator keeps it, takes it out, or puts it back. */
+function ContextActions({ message }: { message: Message }) {
+  const { api, run } = useConsole();
+  const { t } = useI18n();
+  const set = (field: 'keep' | 'drop' | 'resolve' | 'restore') => run(() => api.compactConversation(message.conversation_id, { [field]: [message.sequence] }), t.workspace.contextChanged[field]);
+  return (
+    <div className="context-actions" title={t.workspace.contextActionsHint}>
+      <span className="muted small">{t.workspace.contextActionsLabel}</span>
+      {message.context !== 'kept' && <ActionButton className="btn btn-quiet btn-small" onAction={() => set('keep')}>{t.workspace.contextDo.keep}</ActionButton>}
+      {message.context !== 'resolved' && <ActionButton className="btn btn-quiet btn-small" onAction={() => set('resolve')}>{t.workspace.contextDo.resolve}</ActionButton>}
+      {message.context !== 'dropped' && <ActionButton className="btn btn-quiet btn-small" onAction={() => set('drop')}>{t.workspace.contextDo.drop}</ActionButton>}
+      {message.context !== null && <ActionButton className="btn btn-quiet btn-small" onAction={() => set('restore')}>{t.workspace.contextDo.restore}</ActionButton>}
+    </div>
+  );
+}
+
+/** The digest of a conversation and what compacting did to it; the operator can rewrite the digest here. */
+function DigestPanel({ conversation, onClose }: { conversation: Conversation; onClose: () => void }) {
+  const { api, events, run } = useConsole();
+  const { t } = useI18n();
+  const digest = conversation.digest;
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(digest?.text ?? '');
+  const [upto, setUpto] = useState(String(conversation.last_seq));
+  const [busy, track] = useBusy();
+  const [log, setLog] = useState<Compaction[]>([]);
+  // The log is read again whenever something happened in this conversation.
+  const stamp = useMemo(() => events.filter((event) => event.conversation_id === conversation.conversation_id).length, [events, conversation.conversation_id]);
+  useEffect(() => {
+    let cancelled = false;
+    void api.compactions(conversation.conversation_id).then((result) => !cancelled && setLog(result.compactions)).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [api, conversation.conversation_id, stamp]);
+  const counts = conversation.context_counts;
+  const uptoNumber = Number(upto);
+  const valid = text.trim() !== '' && Number.isInteger(uptoNumber) && uptoNumber >= (digest?.upto_seq ?? 1) && uptoNumber <= conversation.last_seq;
+  return (
+    <aside className="panel sheet" aria-label={t.workspace.digestTitle}>
+      <header className="panel-head">
+        <h2>{t.workspace.digestTitle}</h2>
+        <button type="button" className="btn btn-quiet btn-icon" aria-label={t.common.close} onClick={onClose}>
+          <Icon name="close" />
+        </button>
+      </header>
+      <section className="panel-section">
+        <p className="muted">{t.workspace.digestIntro}</p>
+        {digest === null && !editing && <p>{t.workspace.digestNone(conversation.message_count)}</p>}
+        {digest !== null && !editing && (
+          <>
+            <p className="muted small">{t.workspace.digestMeta(digest.upto_seq, digest.by, formatTime(digest.written_at, t.dateLocale))}</p>
+            <div className="digest-text"><Markdown text={digest.text} /></div>
+          </>
+        )}
+        {editing ? (
+          <form
+            className="hook-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void track(run(() => api.compactConversation(conversation.conversation_id, { summary: text.trim(), upto_seq: uptoNumber }), t.workspace.digestSaved)).then((saved) => saved !== undefined && setEditing(false));
+            }}
+          >
+            <textarea className="rules-text" rows={10} maxLength={6000} value={text} aria-label={t.workspace.digestTitle} placeholder={t.workspace.digestPlaceholder} onChange={(event) => setText(event.target.value)} />
+            <label className="field">
+              <span>{t.workspace.digestUpto(conversation.last_seq)}</span>
+              <input inputMode="numeric" value={upto} onChange={(event) => setUpto(event.target.value)} />
+            </label>
+            <div className="row-actions">
+              <button type="button" className="btn btn-quiet" onClick={() => setEditing(false)}>{t.common.cancel}</button>
+              <SubmitButton busy={busy} disabled={!valid}>{t.common.save}</SubmitButton>
+            </div>
+          </form>
+        ) : (
+          <div className="row-actions">
+            <button
+              type="button"
+              className="btn btn-quiet"
+              onClick={() => {
+                setText(digest?.text ?? '');
+                setUpto(String(digest !== null && conversation.last_seq - digest.upto_seq < 20 ? digest.upto_seq : conversation.last_seq));
+                setEditing(true);
+              }}
+            >
+              <Icon name="edit" /> {digest === null ? t.workspace.digestWrite : t.workspace.digestEdit}
+            </button>
+          </div>
+        )}
+      </section>
+      <DigestHistory conversation={conversation} stamp={stamp} />
+      <section className="panel-section">
+        <h3 className="panel-sub">{t.workspace.contextCountsTitle}</h3>
+        <p>{t.workspace.contextCounts(counts.kept, counts.dropped, counts.resolved)}</p>
+        <p className="muted small">{t.workspace.contextCountsHint}</p>
+      </section>
+      <section className="panel-section">
+        <h3 className="panel-sub">{t.workspace.compactionsTitle}</h3>
+        {log.length === 0 && <p className="muted">{t.workspace.compactionsNone}</p>}
+        <ul className="detail-list">
+          {log.map((entry, index) => (
+            <li key={`${entry.at}-${index}`}>
+              <span>{entry.by}</span>
+              <span className="muted small">{t.workspace.compactionLine(entry)}</span>
+              <span className="detail-time">{formatTime(entry.at, t.dateLocale)}</span>
+            </li>
+          ))}
+        </ul>
+      </section>
+    </aside>
+  );
+}
+
+/** Every digest the conversation was given: closed by default; each opens to its text and can be put back in use. */
+function DigestHistory({ conversation, stamp }: { conversation: Conversation; stamp: number }) {
+  const { api, run } = useConsole();
+  const { t } = useI18n();
+  const [list, setList] = useState<DigestEntry[]>([]);
+  const [open, setOpen] = useState(false);
+  const [shown, setShown] = useState<number | null>(null);
+  const digestKey = `${conversation.digest?.upto_seq ?? 0}-${conversation.digest?.written_at ?? ''}`;
+  useEffect(() => {
+    let cancelled = false;
+    void api.digests(conversation.conversation_id).then((result) => !cancelled && setList(result.digests)).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [api, conversation.conversation_id, stamp, digestKey]);
+  if (list.length < 2) {
+    return null;
+  }
+  return (
+    <section className="panel-section">
+      <button type="button" className="disclosure" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <Icon name={open ? 'minus' : 'plus'} /> {t.workspace.digestHistoryTitle(list.length)}
+      </button>
+      {open && (
+        <div className="digest-history">
+          <p className="muted small">{t.workspace.digestHistoryHint}</p>
+          <ol className="digest-list">
+            {list.map((entry) => (
+              <li key={entry.digest_id} className={entry.current ? 'is-current' : ''}>
+                <div className="digest-row">
+                  <button type="button" className="digest-pick" aria-expanded={shown === entry.digest_id} onClick={() => setShown(shown === entry.digest_id ? null : entry.digest_id)}>
+                    <span className="digest-range">{t.workspace.digestRange(entry.upto_seq)}</span>
+                    <span className="muted small">{entry.by} · {formatTime(entry.written_at, t.dateLocale)}</span>
+                  </button>
+                  {entry.current ? (
+                    <span className="tag tag-ok">{t.workspace.digestInUse}</span>
+                  ) : (
+                    <ActionButton className="btn btn-quiet btn-small" onAction={() => run(async () => setList((await api.useDigest(conversation.conversation_id, entry.digest_id)).digests), t.workspace.digestUsed)}>
+                      {t.workspace.digestUse}
+                    </ActionButton>
+                  )}
+                </div>
+                {shown === entry.digest_id && <div className="digest-text"><Markdown text={entry.text} /></div>}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -218,6 +383,9 @@ function MessageItem({ message, members, parent }: { message: Message; members: 
         <header className="msg-head">
           <span className="msg-author">{senderName(message, t)}</span>
           {message.sender.label !== null && <span className="msg-label">{message.sender.label}{message.from_window !== null && ` · ${message.from_window.name}`}</span>}
+          {message.context !== null && (
+            <span className="tag" title={t.workspace.contextTitle[message.context]}>{t.workspace.contextLabel[message.context]}</span>
+          )}
           {message.to_windows.length > 0 && (
             <span className="tag" title={t.workspace.toWindowsTitle}>{t.workspace.toWindows(message.to_windows.map((entry) => entry.name).join(t.common.sep))}</span>
           )}
@@ -611,6 +779,8 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
   const [selectedId, setSelectedId] = useState(() => window.localStorage.getItem(SELECTED_KEY) ?? '');
   const [filter, setFilter] = useState<Filter>('all');
   const [panelOpen, setPanelOpen] = useState(false);
+  // The digest panel takes the same place as the members panel; one of them at a time.
+  const [digestOpen, setDigestOpen] = useState(false);
   const [dialog, setDialog] = useState<'project' | 'conversation' | null>(null);
   const [listFilter, setListFilter] = useState<ListFilter>(NO_FILTER);
   const [tidying, setTidying] = useState(false);
@@ -691,7 +861,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
   }
 
   return (
-    <div className={`workspace ${panelOpen ? 'has-panel' : ''}`}>
+    <div className={`workspace ${panelOpen || digestOpen ? 'has-panel' : ''}`}>
       <nav className="sidebar" aria-label={t.workspace.sidebarAria}>
         <div className="sidebar-actions">
           <details className="menu">
@@ -819,7 +989,27 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
             </div>
             <div className="thread-actions">
               {conversation.status === 'archived' && <Pill tone="muted">{t.workspace.archivedPill}</Pill>}
-              <button type="button" className={`btn btn-quiet ${panelOpen ? 'is-open' : ''}`} aria-pressed={panelOpen} onClick={() => setPanelOpen((open) => !open)}>
+              <button
+                type="button"
+                className={`btn btn-quiet ${digestOpen ? 'is-open' : ''}`}
+                aria-pressed={digestOpen}
+                title={t.workspace.digestBtnTitle}
+                onClick={() => {
+                  setPanelOpen(false);
+                  setDigestOpen((open) => !open);
+                }}
+              >
+                <Icon name="broom" /> {conversation.digest === null ? t.workspace.digestBtn : t.workspace.digestBtnUpto(conversation.digest.upto_seq)}
+              </button>
+              <button
+                type="button"
+                className={`btn btn-quiet ${panelOpen ? 'is-open' : ''}`}
+                aria-pressed={panelOpen}
+                onClick={() => {
+                  setDigestOpen(false);
+                  setPanelOpen((open) => !open);
+                }}
+              >
                 <Icon name="agents" /> {t.workspace.membersBtn(conversation.members.length)}
               </button>
               <ConversationMenu conversation={conversation} />
@@ -884,6 +1074,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
       )}
 
       {conversation !== undefined && panelOpen && <MembersPanel conversation={conversation} onOpenAgents={onOpenAgents} onClose={() => setPanelOpen(false)} />}
+      {conversation !== undefined && digestOpen && !panelOpen && <DigestPanel key={conversation.conversation_id} conversation={conversation} onClose={() => setDigestOpen(false)} />}
       {dialog === 'project' && <NewProjectDialog onClose={() => setDialog(null)} />}
       {dialog === 'conversation' && <NewConversationDialog projectId={conversation?.project_id ?? data.projects[0].project_id} onClose={() => setDialog(null)} onCreated={setSelectedId} />}
     </div>

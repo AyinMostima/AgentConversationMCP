@@ -24,7 +24,7 @@ namespace {
 using acm::json;
 using Callback = std::function<void(const drogon::HttpResponsePtr&)>;
 
-constexpr const char* kVersion = "0.4.0";
+constexpr const char* kVersion = "0.5.0";
 
 struct Options {
     std::filesystem::path data_dir;

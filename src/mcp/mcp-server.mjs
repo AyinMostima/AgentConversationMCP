@@ -4,7 +4,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SERVER_INSTRUCTIONS, TOOLS } from './tools.mjs';
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 export const HOST = '127.0.0.1';
 
 /**

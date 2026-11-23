@@ -1,6 +1,6 @@
 {
   "name": "agent-conversation-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AGORA (AgentConversationMCP): local multi-agent MCP conversation hub with a C++23 control core, client hooks, and a bilingual operator web console.",
   "license": "MIT",
   "repository": {

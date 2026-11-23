@@ -53,12 +53,21 @@ class Delivery {
 public:
     // How many messages one hook run lists, and how much of each.
     static constexpr std::int64_t kMaxListed = 8;
+    // A window that has messages waiting for its answer is reminded of them in its prompt
+    // hook, this often at most (some clients run that hook before every call of the model).
+    static constexpr std::int64_t kReminderSeconds = 600;
+    static constexpr std::int64_t kReminderListed = 5;
+    static constexpr std::size_t kReminderBytes = 200;
     static constexpr std::size_t kBodyBytes = 1200;
     // A message that is not addressed to the window it is shown to: enough to see
     // what it is about. check_in and read_messages have the rest.
     static constexpr std::size_t kBriefBytes = 300;
     static constexpr std::size_t kDigestBytes = 3000;
     static constexpr std::size_t kUrgentBodyBytes = 4000;
+    // All message text of one hook run. The first entries get their full allowance; once
+    // this is spent, each further one gets a few lines.
+    static constexpr std::size_t kHookBytes = 10000;
+    static constexpr std::size_t kLeastBytes = 200;
     // Urgent deliveries (stop, watch, command) a window gets within kWindowSeconds.
     static constexpr std::int64_t kMaxUrgentDeliveries = 6;
     static constexpr std::int64_t kWindowSeconds = 600;

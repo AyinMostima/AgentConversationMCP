@@ -81,6 +81,17 @@ public:
     /// session). The first time it is known, what was written there before gets it as well:
     /// everything, or only what is not older than `since` when the client knows that the model
     /// changed at that time.
+    // How far back a message still counts as waiting for an answer.
+    static constexpr std::int64_t kWaitingSeconds = 24 * 3600;
+    /// Messages addressed to a reader that it has neither answered nor acknowledged, newest
+    /// first. Addressed means: in a direct conversation of its session, sent to its session
+    /// alone, or naming its window (also by another window of its own application).
+    /// Answered means: the reader wrote in that conversation afterwards. Reading alone does
+    /// not settle a message. `window_id` is empty when the caller's window is not known:
+    /// then what names windows is left to those windows. With `waited_seconds`, only what
+    /// was sent at least that long ago.
+    std::vector<std::string> waiting_ids(std::string_view session_id, std::string_view window_id, std::int64_t limit,
+                                         std::int64_t waited_seconds = 0);
     /// Windows that wrote messages which carry no model, and whose client keeps a record
     /// that may name it: {windows: [{window_id, client, client_session}]}.
     json wanting_model();

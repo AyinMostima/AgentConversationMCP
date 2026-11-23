@@ -26,14 +26,16 @@ void erase_setting(Database& database, std::string_view key);
 bool open_mode(Database& database);
 void set_open_mode(Database& database, bool enabled);
 
-// A value of 0 switches that limit off.
+// A value of 0 switches that limit off. A session is a whole application, with
+// every conversation it has open: the defaults leave room for several of them
+// working at once, and still stop two sessions that answer each other without end.
 struct MessageLimits {
-    std::int64_t per_minute = 12;
-    std::int64_t per_hour = 120;
-    std::int64_t duplicate_window_seconds = 600;
+    std::int64_t per_minute = 60;
+    std::int64_t per_hour = 600;
+    std::int64_t duplicate_window_seconds = 120;
     // How many messages a session may mark urgent per hour. An urgent message
     // interrupts its readers, so past this number it is stored as an ordinary one.
-    std::int64_t urgent_per_hour = 6;
+    std::int64_t urgent_per_hour = 30;
 };
 
 MessageLimits message_limits(Database& database);

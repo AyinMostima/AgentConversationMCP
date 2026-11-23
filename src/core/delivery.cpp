@@ -171,15 +171,21 @@ std::string Delivery::compose(const std::vector<Pending>& listed, std::int64_t m
     // How others address this conversation, so it can say so and recognise itself.
     text += std::format(" This conversation is window \"{}\".\n", window_name);
     int number = 0;
+    std::size_t left = kHookBytes;
     for (const auto& entry : listed) {
+        const std::size_t allowance = entry.urgent ? kUrgentBodyBytes : entry.to_you || entry.personal ? kBodyBytes : kBriefBytes;
+        const std::size_t allowed = std::min(allowance, std::max(left, kLeastBytes));
+        left -= std::min(left, std::min(entry.body.size(), allowed));
         text += std::format("\n{}. {}{} in {}{}, {}:\n{}\n", ++number, entry.urgent ? "[URGENT] " : "", entry.from,
                             entry.where, entry.to_you ? ", addressed to this window" : "", entry.created_at,
-                            clip(entry.body, entry.urgent ? kUrgentBodyBytes
-                                                          : entry.to_you || entry.personal ? kBodyBytes : kBriefBytes));
+                            clip(entry.body, allowed));
     }
     text += "\n";
-    if (more > 0) {
+    if (more > 0 && interrupting) {
         text += std::format("{} more are waiting and are not listed here. ", more);
+    } else if (more > 0) {
+        text += std::format("{} earlier one(s) are not listed here: check_in gives the newest of each conversation and "
+                            "a digest of what came before. ", more);
     }
     if (interrupting) {
         text += "Deal with them now: call the acm check_in tool, do what they ask as far as your user's instructions "
@@ -285,16 +291,20 @@ json Delivery::hook(const Session& session, const json& args) {
         // An urgent route interrupts: only for what names this window (see interrupting).
         std::vector<Pending> listed = urgent_only
                                           ? interrupting(session.session_id, window.window_id, floor)
-                                          : pending(session.session_id, window.window_id, floor, false, kMaxListed + 1);
-        const bool cut = static_cast<std::int64_t>(listed.size()) > kMaxListed;
+                                          : pending(session.session_id, window.window_id, floor, false, 1000);
+        bool cut = static_cast<std::int64_t>(listed.size()) > kMaxListed;
         std::int64_t more = 0;
         if (cut && urgent_only) {
             more = static_cast<std::int64_t>(listed.size()) - kMaxListed;
             listed.resize(static_cast<std::size_t>(kMaxListed));
         } else if (cut) {
-            listed.pop_back();
-            more = static_cast<std::int64_t>(
-                pending(session.session_id, window.window_id, listed.back().rowid, false, 1000).size());
+            // A window that is far behind is shown the newest, not its backlog from the oldest
+            // end, prompt after prompt: what is old is history by now, and check_in has it as a
+            // digest. Everything counts as looked at; what was addressed to the window and is
+            // not among the newest comes back as a reminder until it is answered.
+            more = static_cast<std::int64_t>(listed.size()) - kMaxListed;
+            listed.erase(listed.begin(), listed.end() - kMaxListed);
+            cut = false;
         }
         const auto urgent = std::ranges::count_if(listed, [](const Pending& entry) { return entry.urgent; });
         json messages = json::array();
@@ -309,7 +319,67 @@ json Delivery::hook(const Session& session, const json& args) {
         result["count"] = listed.size();
         result["urgent"] = urgent;
         result["more"] = more;
-        result["text"] = compose(listed, more, event, window.name);
+        // What is for this window comes first in what it is shown: its name on the message,
+        // its session alone, its direct conversation. The rest keeps its order.
+        std::vector<Pending> ordered = listed;
+        if (!urgent_only) {
+            std::ranges::stable_partition(ordered, [](const Pending& entry) { return entry.to_you || entry.personal; });
+        }
+        result["text"] = compose(ordered, more, event, window.name);
+        // Messages addressed to this window that have gone unanswered for a while: a short
+        // reminder in front of everything else, at most every kReminderSeconds. What only
+        // just arrived is in front of the window as it is.
+        if (!urgent_only) {
+            std::vector<std::string> waiting =
+                windows_.waiting_ids(session.session_id, window.window_id, kReminderListed + 1, kReminderSeconds);
+            // Not the ones this very hook lists as new.
+            std::erase_if(waiting, [&](const std::string& id) {
+                return std::ranges::any_of(listed, [&](const Pending& entry) { return entry.message_id == id; });
+            });
+            Statement last = database_.query("SELECT reminded_at FROM windows WHERE window_id = ?", window.window_id);
+            last.step();
+            const bool due = last.optional_text(0).value_or("") <= to_rfc3339(moment - std::chrono::seconds(kReminderSeconds));
+            if (!waiting.empty() && due) {
+                const bool more_waiting = static_cast<std::int64_t>(waiting.size()) > kReminderListed;
+                if (more_waiting) {
+                    waiting.pop_back();
+                }
+                std::string block = std::format(
+                    "[ACM] {}{} message(s) addressed to this conversation still wait for an answer. Answer them before "
+                    "other work: reply where each was sent, or call the acm acknowledge_message tool with its id when no "
+                    "reply is needed. check_in lists them in full under awaiting_your_reply.",
+                    more_waiting ? "More than " : "", waiting.size());
+                // Oldest first.
+                for (auto id = waiting.rbegin(); id != waiting.rend(); ++id) {
+                    Statement row = database_.query(
+                        "SELECT m.body, m.created_at, m.sender_kind, a.display_name, aw.name, c.kind, c.title "
+                        "FROM messages m JOIN conversations c ON c.conversation_id = m.conversation_id "
+                        "LEFT JOIN agent_sessions s ON s.session_id = m.sender_session_id "
+                        "LEFT JOIN agents a ON a.agent_id = s.agent_id "
+                        "LEFT JOIN windows aw ON aw.window_id = m.author_window_id WHERE m.message_id = ?",
+                        *id);
+                    if (!row.step()) {
+                        continue;
+                    }
+                    const std::string from = row.text(2) == "operator" ? std::string("the operator (console)")
+                                             : row.optional_text(4)
+                                                   ? std::format("{} window \"{}\"", row.optional_text(3).value_or("unknown"), *row.optional_text(4))
+                                                   : row.optional_text(3).value_or("unknown");
+                    const std::string kind = row.text(5);
+                    const std::string where = kind == "lobby"    ? std::string("the lobby")
+                                              : kind == "direct" ? std::string("a direct conversation with you")
+                                                                 : std::format("\"{}\"", row.text(6));
+                    block += std::format("\n- {} in {}, {} ({}): {}", from, where, row.text(1), *id,
+                                         clip(row.text(0), kReminderBytes));
+                }
+                const std::string rest = result.at("text").get<std::string>();
+                result["text"] = rest.empty() ? block : block + "\n\n" + rest;
+                result["waiting"] = waiting.size();
+                if (!peek) {
+                    database_.execute("UPDATE windows SET reminded_at = ? WHERE window_id = ?", now, window.window_id);
+                }
+            }
+        }
         // A conversation that was summarized since this window last read it: the digest is
         // put in front of the window once, in place of the messages it covers.
         if (!urgent_only) {

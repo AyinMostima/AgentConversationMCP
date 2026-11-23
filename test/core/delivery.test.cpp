@@ -144,27 +144,58 @@ TEST_CASE("a message addressed to someone else is never shown", "[delivery][hook
     REQUIRE(f.hook(f.antigravity, "stop").at("count") == 1);
 }
 
-TEST_CASE("a long list is cut and a long text is clipped at a character", "[delivery][hook]") {
+TEST_CASE("a long list shows its newest end and a long text is clipped at a character", "[delivery][hook]") {
     Fixture f;
     acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0});
     std::string chinese;
     for (int i = 0; i < 1000; ++i) {
         chinese += "\xE4\xB8\xAD";  // one three-byte character
     }
-    f.say(f.codex, chinese);
     for (int i = 0; i < 10; ++i) {
         f.say(f.codex, "note " + std::to_string(i));
     }
+    f.say(f.codex, chinese);
     const json first = f.hook(f.claude, "prompt");
     REQUIRE(first.at("count") == acm::Delivery::kMaxListed);
     REQUIRE(first.at("more") == 3);
     const std::string text = first.at("text");
-    REQUIRE(text.contains("3 more are waiting"));
+    // The newest eight; the three before them are named as a number, not shown.
+    REQUIRE(text.contains("3 earlier one(s) are not listed here"));
+    REQUIRE(text.contains("note 9"));
+    REQUIRE_FALSE(text.contains("note 2"));
     REQUIRE(text.contains("[... cut"));
     // Still valid UTF-8: serialising would throw on a character cut in half.
     REQUIRE_NOTHROW(json(text).dump());
-    // The rest comes with the next prompt rather than being skipped.
-    REQUIRE(f.hook(f.claude, "prompt").at("count") == 3);
+    // The backlog does not come eight at a time with the following prompts: it is history,
+    // and check_in still has all of it as unread.
+    REQUIRE(f.hook(f.claude, "prompt").at("count") == 0);
+    REQUIRE(f.messages.unread(f.claude, f.lobby, 15).at("messages").size() == 11);
+}
+
+TEST_CASE("one hook run keeps to a size however long its messages are", "[delivery][hook][bounds]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    f.hook(f.claude, "prompt");
+    // Eight long messages for this session alone: each could take its full allowance.
+    for (int i = 0; i < 8; ++i) {
+        f.say(f.codex, "PERSONAL-" + std::to_string(i) + " " + std::string(6000, 'p'), false, json::array({f.claude.session_id}));
+    }
+    const std::string text = f.hook(f.claude, "prompt").at("text");
+    REQUIRE(text.contains("PERSONAL-0"));
+    REQUIRE(text.contains("PERSONAL-7"));
+    REQUIRE(text.size() < acm::Delivery::kHookBytes + 4000);
+    // The same for urgent ones, which get more room each.
+    Fixture g;
+    acm::set_message_limits(g.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    g.hook(g.claude, "stop");
+    g.pass(acm::Delivery::kSettleSeconds);
+    for (int i = 0; i < 5; ++i) {
+        g.say(g.codex, "URGENT-" + std::to_string(i) + " " + std::string(6000, 'u'), true, json::array({g.claude.session_id}));
+    }
+    const std::string urgent = g.hook(g.claude, "stop").at("text");
+    REQUIRE(urgent.contains("URGENT-0"));
+    REQUIRE(urgent.contains("URGENT-4"));
+    REQUIRE(urgent.size() < acm::Delivery::kHookBytes + 4000);
 }
 
 TEST_CASE("the end of a turn continues only for urgent messages, once", "[delivery][urgent]") {
@@ -195,6 +226,57 @@ TEST_CASE("the end of a turn continues only for urgent messages, once", "[delive
     const json view = f.delivery.list().at(0);
     REQUIRE(view.at("last_urgent").at("route") == "stop");
     REQUIRE(view.at("last_urgent").at("status") == "ok");
+}
+
+TEST_CASE("what is addressed to a window comes first, and it is reminded of what waits for its answer",
+          "[delivery][waiting]") {
+    Fixture f;
+    const auto codex_hook = [&](const std::string& event) {
+        return f.hook(f.codex, event, {{"client", "codex"}, {"client_session", "thread-1"}});
+    };
+    codex_hook("prompt");
+    f.say(f.claude, "everybody: the nightly run is done");
+    f.say(f.claude, "codex: which commit did you test?", false, json::array({f.codex.session_id}));
+    // New messages: the one for this session alone is listed before the one for everybody.
+    const json first = codex_hook("prompt");
+    const std::string shown = first.at("text");
+    REQUIRE(first.at("count") == 2);
+    REQUIRE(shown.find("which commit did you test") < shown.find("the nightly run is done"));
+    // It only just arrived: no reminder yet, and none while nothing has waited long enough.
+    REQUIRE_FALSE(first.contains("waiting"));
+    REQUIRE_FALSE(codex_hook("prompt").contains("waiting"));
+
+    // Unanswered after a while: the next prompt begins with a reminder of it, and of nothing else.
+    f.pass(acm::Delivery::kReminderSeconds + 1);
+    const json later = codex_hook("prompt");
+    REQUIRE(later.at("waiting") == 1);
+    REQUIRE(later.at("count") == 0);
+    const std::string reminder = later.at("text");
+    REQUIRE(reminder.contains("still wait for an answer"));
+    REQUIRE(reminder.contains("which commit did you test"));
+    REQUIRE_FALSE(reminder.contains("the nightly run is done"));
+    // Not with every prompt (some clients run this hook before every call of the model) ...
+    REQUIRE_FALSE(codex_hook("prompt").contains("waiting"));
+    // ... nor where a turn ends, and a look without effect does not count as a reminder.
+    REQUIRE_FALSE(codex_hook("stop").contains("waiting"));
+    // Again after the interval, as long as nothing was said in answer.
+    f.pass(acm::Delivery::kReminderSeconds + 1);
+    REQUIRE(codex_hook("prompt").at("waiting") == 1);
+    // The other sessions are not reminded of what was not for them.
+    REQUIRE_FALSE(f.hook(f.antigravity, "prompt", {{"client", "antigravity"}, {"client_session", "conv-1"}}).contains("waiting"));
+
+    // Answered: nothing more to remind of.
+    f.say(f.codex, "claude: commit 1a2b3c");
+    f.pass(acm::Delivery::kReminderSeconds + 1);
+    REQUIRE_FALSE(codex_hook("prompt").contains("waiting"));
+    // Or acknowledged, when no reply is needed.
+    const json note = f.say(f.claude, "codex: noted, thanks", false, json::array({f.codex.session_id}));
+    codex_hook("prompt");
+    f.pass(acm::Delivery::kReminderSeconds + 1);
+    REQUIRE(codex_hook("prompt").at("waiting") == 1);
+    f.messages.acknowledge(f.codex, {{"message_id", note.at("message_id")}});
+    f.pass(acm::Delivery::kReminderSeconds + 1);
+    REQUIRE_FALSE(codex_hook("prompt").contains("waiting"));
 }
 
 TEST_CASE("a window that was woken is not shown the same message again", "[delivery][urgent]") {

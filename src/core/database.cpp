@@ -554,6 +554,10 @@ constexpr const char* kMigrations[] = {
     UPDATE agent_sessions SET model = NULL
     WHERE EXISTS (SELECT 1 FROM windows w WHERE w.session_id = agent_sessions.session_id);
     )sql",
+    // 032 - when a window was last reminded of the messages that wait for its answer.
+    R"sql(
+    ALTER TABLE windows ADD COLUMN reminded_at TEXT;
+    )sql",
 };
 
 }  // namespace

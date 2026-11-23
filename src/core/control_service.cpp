@@ -148,9 +148,12 @@ json ControlService::call_tool(std::string_view token, std::string_view tool, co
     }
     if (tool == "read_messages") {
         json page = messages_.read(session, args);
-        // Reading by hand also counts as caught up, so check_in does not repeat it.
-        messages_.advance_cursor(session, page.at("conversation_id").get<std::string>(),
-                                 page.at("next_cursor").get<std::int64_t>(), window);
+        // Reading by hand also counts as caught up, so check_in does not repeat it. Single
+        // messages asked for by id say nothing about how far the reader is.
+        if (page.contains("next_cursor")) {
+            messages_.advance_cursor(session, page.at("conversation_id").get<std::string>(),
+                                     page.at("next_cursor").get<std::int64_t>(), window);
+        }
         return page;
     }
     if (tool == "forward_message") {
@@ -887,7 +890,12 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
         conversations_.require_member(session, *only);
     }
     json conversations = json::array();
-    for (const auto& entry : conversations_.list_for_session(session)) {
+    // One bound on the text of all messages in this answer, spent on what is said to this
+    // session alone before what is said to everybody.
+    std::size_t text_left = Messages::kCheckInBytes;
+    json mine = conversations_.list_for_session(session);
+    std::stable_partition(mine.begin(), mine.end(), [](const json& item) { return item.at("kind") == json("direct"); });
+    for (const auto& entry : mine) {
         const std::string id = entry.at("conversation_id");
         if (only && id != *only) {
             continue;
@@ -915,7 +923,7 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
             if (first > 0) {
                 item["tasks_not_listed"] = first;
             }
-            const json page = messages_.unread(session, id, limit, window);
+            const json page = messages_.unread(session, id, limit, window, &text_left);
             item["new_messages"] = page.at("messages");
             item["has_more"] = page.at("has_more");
             item["next_cursor"] = page.at("next_cursor");
@@ -926,6 +934,9 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
             // Older messages that compacting kept in front of readers.
             if (page.contains("kept_messages")) {
                 item["kept_messages"] = page.at("kept_messages");
+            }
+            if (page.contains("kept_not_listed")) {
+                item["kept_not_listed"] = true;
             }
             if (page.at("skipped_earlier").get<std::int64_t>() > 0) {
                 item["skipped_earlier"] = page.at("skipped_earlier");
@@ -938,6 +949,34 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
         }
         conversations.push_back(std::move(item));
     }
+    // What is said to this session alone comes before what is said to everybody: a reader
+    // that stops early has seen its direct conversations.
+    std::stable_partition(conversations.begin(), conversations.end(),
+                          [](const json& item) { return item.at("kind") == json("direct"); });
+    // What is addressed to this reader and still waits for an answer. Reading does not
+    // settle a message, so it comes back with every check-in; where this check-in also lists
+    // it as new, its text is there and not repeated here.
+    json waiting = only ? json::array()
+                        : messages_.waiting_view(
+                              session,
+                              windows_.waiting_ids(session.session_id, window != nullptr ? window->window_id : std::string(),
+                                                   Messages::kWaitingListed),
+                              window);
+    for (auto& entry : waiting) {
+        for (const auto& item : conversations) {
+            if (item.at("conversation_id") != entry.at("conversation_id") || !item.contains("new_messages")) {
+                continue;
+            }
+            for (const auto& fresh : item.at("new_messages")) {
+                // In full there: an overview of it there is no reason to leave the text out here.
+                if (fresh.at("message_id") == entry.at("message_id") && !fresh.value("cut", false)) {
+                    entry["body"] = nullptr;
+                    entry["in_new_messages"] = true;
+                    entry.erase("cut");
+                }
+            }
+        }
+    }
     // Outcomes of bot requests this session made, and requests waiting for it as a bot host.
     const json bot_news = bots_.news(session);
     // Which model is at work here, as far as it is known. A client whose hooks do not say
@@ -945,6 +984,17 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
     const auto model = windows_.model_of(session, window);
     return {{"session_id", session.session_id},
             {"label", session.label},
+            // Named so that it comes first in the answer (the fields are written in alphabetical order).
+            {"awaiting_your_reply",
+             waiting.empty()
+                 ? json(nullptr)
+                 : json{{"note",
+                         "Messages addressed to you (a direct message, a message for your session alone, or one "
+                         "that names your window) that you have not answered. Deal with these before anything else "
+                         "in this check-in. Each one is listed again with every check_in until you reply in the "
+                         "conversation it was sent in or, when no reply is needed, call acknowledge_message with its "
+                         "message_id."},
+                        {"messages", waiting}}},
             // The conversation this call comes from: its name is how others address it (to_windows).
             {"window", window != nullptr ? json{{"window_id", window->window_id}, {"name", window->name}} : json(nullptr)},
             {"model", model ? json(*model) : json(nullptr)},

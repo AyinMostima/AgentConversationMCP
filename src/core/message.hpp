@@ -61,6 +61,21 @@ public:
 
     // Agent: {conversation_id, after_seq?, limit?} -> messages visible to the caller
     // with seq > after_seq, plus next_cursor, has_more and last_seq.
+    // What one read may hand a session. Text is what fills a reader's context: every way
+    // of reading has a bound on it, not only on the number of messages.
+    //   kFullBytes     most of one message in a check-in, also one addressed to the reader
+    //   kCheckInBytes  all message text of one check-in (new and kept, every conversation)
+    //   kKeptListed    how many kept messages come along, the newest ones; one that was
+    //                  written longer than kKeptFreshSeconds ago comes as an overview
+    //   kPageBytes     one page of read_messages or get_inbox: it ends early once it holds this much
+    static constexpr std::size_t kFullBytes = 4000;
+    static constexpr std::size_t kCheckInBytes = 24000;
+    static constexpr std::int64_t kKeptListed = 12;
+    static constexpr std::int64_t kKeptFreshSeconds = 24 * 3600;
+    static constexpr std::size_t kPageBytes = 48000;
+    /// read_messages: {conversation_id, after_seq?, limit?, message_ids?}. With message_ids,
+    /// those messages in full. With after_seq, the page after it, oldest first. With neither,
+    /// the newest messages of the conversation (first_seq says where they begin).
     json read(const Session& session, const json& args);
 
     // Agent: {conversation_id?, limit?} -> messages addressed to the caller that
@@ -86,8 +101,21 @@ public:
     // how many between were left out (skipped_earlier; read_messages has them). A
     // message that is not addressed to the reader comes cut to kOverviewBytes.
     static constexpr std::size_t kOverviewBytes = 500;
+    // Messages that wait for an answer (Windows::waiting_ids): how many are listed, and how
+    // much of each.
+    static constexpr std::int64_t kWaitingListed = 10;
+    static constexpr std::size_t kWaitingBytes = 4000;
+    // All of them together, since the list comes with every check-in: the newest get their
+    // text first, older ones what is left, and never less than a reminder of this size.
+    static constexpr std::size_t kWaitingTotalBytes = 8000;
+    static constexpr std::size_t kWaitingReminderBytes = 300;
+    /// The messages with these ids (newest first, as Windows::waiting_ids gives them) as
+    /// check_in lists them: oldest first, each with where it was sent and why it is the
+    /// reader's to answer, and with its text within the sizes above.
+    json waiting_view(const Session& session, const std::vector<std::string>& ids, const Window* window);
+    /// `budget` is what is left of kCheckInBytes for this check-in; it is counted down.
     json unread(const Session& session, std::string_view conversation_id, std::int64_t limit,
-                const Window* window = nullptr);
+                const Window* window = nullptr, std::size_t* budget = nullptr);
 
     // Moves the caller's read cursor forward; it never moves back.
     void advance_cursor(const Session& session, std::string_view conversation_id, std::int64_t sequence,
@@ -117,6 +145,9 @@ public:
 private:
     json message_view(std::string_view message_id, const Session* viewer);
     json receipts(std::string_view message_id);
+    /// One page of a conversation as a reader sees it, oldest first; `max_bytes` 0 is no bound.
+    json page(const Session& session, std::string_view conversation_id, std::int64_t after_seq, std::int64_t limit,
+              std::size_t max_bytes);
     void mark_read(const Session& session, const std::vector<std::string>& message_ids,
                    std::string_view conversation_id, std::string_view project_id);
 

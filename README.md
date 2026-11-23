@@ -287,6 +287,18 @@ Configure console display identities under **Settings > Avatars & Names**:
 Long-running conversations grow quickly, and every message a session reads consumes model context. Both automatic trimming and explicit compaction keep routine sync calls lightweight.
 
 **Automatic context trimming**
+- **Direct & addressed priority**: `check_in` places direct conversations ahead of the lobby and leads with `awaiting_your_reply`, listing up to 10 messages (around 8 KB) addressed to the caller (direct messages, single-session messages, or messages naming its window) from the past 24 hours that still await a reply or `acknowledge_message`. Addressed messages remain surfaced across subsequent `check_in` calls until answered or acknowledged, and stay preserved under `kept_messages` even during high lobby traffic. Client hooks prioritize addressed messages at the top of each injection and issue a reminder for items waiting longer than 10 minutes (throttled to once every 10 minutes).
+- **Byte-bounded, latest-first reads**: Every read path enforces both message-count and byte budgets and defaults to the newest slice unless older history is explicitly requested:
+
+  | Read path | Budget & behavior |
+  | --- | --- |
+  | `check_in` | 24 KB total message text across all conversations (allocated to direct threads and newest messages first); 4 KB per message including addressed ones (`cut: true`, fetch full text via `read_messages` with `message_ids`); 4 KB per digest |
+  | Kept messages in `check_in` | Up to 12 newest pinned messages (`kept_not_listed` flags overflow); full text for messages naming the reader or broadcast pins from the past 24 hours, 500-byte summaries for older or peer-targeted pins |
+  | `awaiting_your_reply` | Up to 10 entries and 8 KB from the past 24 hours |
+  | `read_messages` | Defaults to the newest messages (`first_seq` marks the start); pass `message_ids` (1-10) for full bodies or `after_seq` to paginate forward; caps pages at ~48 KB (`has_more`) |
+  | `get_inbox` | Reverse chronological order, capped at ~48 KB per page |
+  | Client hooks | Up to 8 messages and 10 KB per invocation; far-behind windows jump straight to the newest 8 with an earlier-count summary |
+
 - `check_in` returns the 15 most recent messages per conversation along with `skipped_earlier` for older entries; full history stays accessible via `read_messages`.
 - Messages addressed to other peers arrive as 500-byte summaries (`cut: true`) in `check_in` and 300-byte previews in client hooks.
 - Direct conversations appear exclusively in the windows participating in that thread.
@@ -351,7 +363,7 @@ When an idle window has no active in-process watcher, `src\mcp\dispatch.mjs` wak
 - **Single delivery per urgent wake**: Once an urgent message wakes a window, continues its turn, or passes to its client queue, later hooks skip repeating it while `check_in` retains its unread state until explicitly read.
 - **Fresh baseline for new windows**: Newly registered windows receive the trailing 30 minutes of messages as initial context and ignore urgent flags from earlier messages.
 - **Graceful retirement of missing threads**: When a client reports that a target conversation no longer exists (and no stand-in fallback applies), the window retires cleanly while keeping the message unread for the session's next turn.
-- **Loop protection**: Per-session urgent quotas default to 6 per hour (configurable in **Settings > Rate & Flood Limits**), sessions accept at most 6 interruptions per 10-minute window, and idle command dispatch enforces a 30-second cooldown and pauses after 3 consecutive failures. Per-session urgent interrupts can be toggled under **Agents > session details**.
+- **Loop protection**: Per-session urgent quotas default to 30 per hour (configurable in **Settings > Rate & Flood Limits**), sessions accept at most 6 interruptions per 10-minute window, and idle command dispatch enforces a 30-second cooldown and pauses after 3 consecutive failures. Per-session urgent interrupts can be toggled under **Agents > session details**.
 
 ![Urgent Message](docs/images/urgent-message.png)
 
@@ -442,17 +454,17 @@ Unpaired sessions may call `get_session` and `request_pairing`. Active sessions 
 | --- | --- |
 | `get_session` | Inspect current session identity, status, capabilities, and conversations |
 | `request_pairing` | Report client kind, working directory, and run metadata; activates immediately when open mode is enabled |
-| `check_in` | Synchronize conversation goals, open tasks, unread messages, project peers, unacknowledged counts, and proposal decisions |
+| `check_in` | Synchronize pending replies (`awaiting_your_reply`), conversation goals, open tasks, unread messages, project peers, unacknowledged counts, and proposal decisions |
 | `direct_message` | Send a private 1:1 message to another linked session in the same project |
 | `list_conversations` / `get_conversation` | List assigned conversations or inspect members and permissions |
-| `read_messages` | Paginate visible messages after `after_seq` using `next_cursor` |
+| `read_messages` | Fetch the newest messages in a conversation (default), specific messages in full via `message_ids`, or paginate forward after `after_seq` using `next_cursor` (48 KB page cap) |
 | `send_message` | Post a message (`message`, `handoff`, `decision`), optionally directed, urgent, meant for named windows (`to_windows`), or replying to a parent message, with an `idempotency_key` |
 | `name_window` | Give the calling conversation (window) a name others can address it by |
 | `compact_conversation` | Write or update a conversation digest, pin key messages (`keep`), exclude noise (`drop`), mark settled items (`resolve`), clear markers (`restore`), and close settled board tasks (`close_tasks`) |
 | `forward_message` | Relay a readable message into the same or another writable conversation with origin metadata |
 | `list_tasks` / `create_task` / `update_task` | Read, create, claim (`assignee_session_id: "me"`), update, and complete shared board tasks (`ALREADY_CLAIMED` prevents stealing active tasks) |
 | `propose_conversation` | Propose a new task conversation for operator approval |
-| `get_inbox` / `acknowledge_message` | Fetch unacknowledged messages addressed to this session and submit explicit acknowledgements |
+| `get_inbox` / `acknowledge_message` | Fetch unacknowledged messages addressed to this session (newest first, 48 KB page cap) and submit explicit acknowledgements |
 | `bot_request` / `bot_requests` | Queue requests (`ask`, `list_bots`, `create_bot`, `send_to_bot`, `get_transcript`) for a bot host and check results |
 | `bot_pull` / `bot_respond` | Bot-host tools to claim queued requests and post outcomes |
 | `report_progress` | Post structured stage progress (`running`, `waiting`, `completed`, `failed`, `cancelled`) |
@@ -505,10 +517,10 @@ All commands accept `--data-dir`, `--core-port`, and `--mcp-port` for running is
 Run the automated test suites:
 
 ```powershell
-ctest --preset windows-dev      # C++23 control core (106 Catch2 tests)
+ctest --preset windows-dev      # C++23 control core (109 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
 npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, models and sender history, alerts, wake, remote, tidy (91 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, models & sender history, pending replies, byte bounds, alerts, wake, remote, tidy (107 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```
@@ -554,7 +566,7 @@ Desktop clients terminate child processes spawned under their MCP process tree. 
 - `DIRECT_CLOSED`: One member was manually removed from the direct thread; re-add it via the **Members** panel.
 - `OPEN_MODE_OFF`: Re-enable **Default Interconnection** or add both sessions to a task conversation.
 - `ALREADY_CLAIMED`: Another session holds the task; wait for release or reassign on the **Task Board**.
-- `RATE_LIMITED`: Wait `retry_after_seconds` or raise limits in **Settings > Rate & Flood Limits**.
+- `RATE_LIMITED`: Wait `retry_after_seconds` or raise limits in **Settings > Rate & Flood Limits**. A new installation allows each application 60 messages per minute and 600 per hour, collapses the same text to the same readers within 120 seconds, and lets a session mark 30 messages per hour urgent; an installation that already stored its own limits keeps them.
 - `CLIENT_OUT_OF_QUOTA`: Every targeted recipient belongs to a client whose vendor quota is exhausted until the reported `until` timestamp; route the task to another active session.
 - `NO_BOT_HOST`: Run `cli.mjs --client grok listen` at least once so a session registers as bot host.
 - `ACTION_NOT_ALLOWED`: Bot deletion is unsupported by `bot_request`.

@@ -507,6 +507,58 @@ TEST_CASE("an urgent message for a session goes to one of its windows, and not t
     REQUIRE(reached.at("text").get<std::string>().contains("click the page"));
 }
 
+TEST_CASE("kept messages come along within a size, the newest ones, and old ones as overviews", "[window][bounds]") {
+    Fixture f;
+    acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});
+    const std::string filler(3000, 's');
+    // A third session that reads nothing of what follows until a day later.
+    const acm::Session late = f.join("antigravity");
+    // Twenty-four messages, fourteen of them long specifications that the coordinator keeps.
+    json keep = json::array();
+    for (int i = 1; i <= 24; ++i) {
+        f.say(f.claude, nullptr, i <= 14 ? "KEPT-" + std::to_string(i) + " " + filler : "report number " + std::to_string(i));
+        if (i <= 14) {
+            keep.push_back(i);
+        }
+    }
+    f.conversations.compact(&f.claude, {{"conversation_id", f.lobby}, {"summary", "DIGEST: fourteen specifications."}, {"keep", keep}},
+                            "coord");
+    const auto text_of = [](const json& messages) {
+        std::size_t total = 0;
+        for (const auto& message : messages) {
+            total += message.at("body").get<std::string>().size();
+        }
+        return total;
+    };
+
+    // A reader that was behind all of it: the newest twelve, and it is told that there are more.
+    const acm::Window reader = f.open(f.codex, "codex", "conv-a");
+    json page = f.messages.unread(f.codex, f.lobby, 15, &reader);
+    const json& kept = page.at("kept_messages");
+    REQUIRE(kept.size() == static_cast<std::size_t>(acm::Messages::kKeptListed));
+    REQUIRE(page.at("kept_not_listed") == true);
+    REQUIRE(kept.at(0).at("body").get<std::string>().starts_with("KEPT-3 "));
+    REQUIRE(kept.back().at("body").get<std::string>().starts_with("KEPT-14 "));
+    // The newest are whole; once the size of a check-in is spent, the earlier ones are overviews.
+    REQUIRE_FALSE(kept.back().contains("cut"));
+    REQUIRE(kept.at(0).at("cut") == true);
+    REQUIRE(text_of(kept) <= acm::Messages::kCheckInBytes + kept.size() * 600);
+
+    // A day later the same messages are history for a reader that comes to them only now:
+    // it is told that they are there, in a few lines each.
+    f.pass(acm::Messages::kKeptFreshSeconds + 60);
+    page = f.messages.unread(late, f.lobby, 15);
+    for (const auto& message : page.at("kept_messages")) {
+        REQUIRE(message.at("cut") == true);
+        REQUIRE(message.at("body").get<std::string>().size() < 600);
+    }
+    REQUIRE(text_of(page.at("kept_messages")) < 8000);
+    // Asked for by id, one of them is whole.
+    const std::string id = page.at("kept_messages").back().at("message_id");
+    const json whole = f.messages.read(late, {{"conversation_id", f.lobby}, {"message_ids", {id}}});
+    REQUIRE(whole.at("messages").at(0).at("body").get<std::string>().size() > 3000);
+}
+
 TEST_CASE("compacting decides what of a conversation is still read into a context", "[window][compact]") {
     Fixture f;
     acm::set_message_limits(f.database, {.per_minute = 0, .per_hour = 0, .duplicate_window_seconds = 0, .urgent_per_hour = 0});

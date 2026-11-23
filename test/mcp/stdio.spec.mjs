@@ -267,7 +267,8 @@ describe('a service started by a bridge', { concurrency: false }, () => {
 // stand-in service makes that change on demand.
 describe('MCP stdio bridge as a relay', { concurrency: false }, () => {
   const relayBase = mkdtempSync(join(tmpdir(), `acm-relay-${runId}-`));
-  const state = { contract: 7, tools: ['alpha'], enrolled: [], calls: [] };
+  // Numbers no real tool contract comes near: the bridge has to take what the service says.
+  const state = { contract: 907, tools: ['alpha'], enrolled: [], calls: [] };
   const servers = [];
   let relayPorts;
   let client;
@@ -341,10 +342,10 @@ describe('MCP stdio bridge as a relay', { concurrency: false }, () => {
     assert.equal(client.getInstructions(), 'said by the running service');
     assert.deepEqual((await client.listTools()).tools.map((entry) => entry.name), ['alpha']);
     // It says that it relays, and which tools its client has been given.
-    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 7, 'the served tools to be reported');
+    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 907, 'the served tools to be reported');
     assert.deepEqual(
       (({ bridge_relay, bridge_tools, bridge_contract }) => ({ bridge_relay, bridge_tools, bridge_contract }))(state.enrolled.at(-1)),
-      { bridge_relay: true, bridge_tools: 1, bridge_contract: 7 },
+      { bridge_relay: true, bridge_tools: 1, bridge_contract: 907 },
     );
   });
 
@@ -360,7 +361,7 @@ describe('MCP stdio bridge as a relay', { concurrency: false }, () => {
 
   it('follows a service that gained a tool, without being restarted', async () => {
     const told = new Promise((done) => client.setNotificationHandler(ToolListChangedNotificationSchema, () => done(true)));
-    state.contract = 8;
+    state.contract = 908;
     state.tools = ['alpha', 'beta'];
     // The next call notices; the client is told to ask for the list again.
     await client.callTool({ name: 'alpha', arguments: {} });
@@ -368,7 +369,7 @@ describe('MCP stdio bridge as a relay', { concurrency: false }, () => {
     assert.deepEqual((await client.listTools()).tools.map((entry) => entry.name), ['alpha', 'beta']);
     // A tool that did not exist when the bridge started can be called through it.
     assert.equal((await client.callTool({ name: 'beta', arguments: {} })).content[0].text, 'beta ran');
-    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 8, 'the new tools to be reported');
+    await waitUntil(() => state.enrolled.at(-1)?.bridge_contract === 908, 'the new tools to be reported');
     assert.equal(state.enrolled.at(-1).bridge_tools, 2);
   });
 });

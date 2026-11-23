@@ -337,8 +337,9 @@ TEST_CASE("the inbox lists unacknowledged addressed messages across conversation
 
     const json inbox = f.core->messages.inbox(f.codex_one, json::object());
     REQUIRE(inbox.at("items").size() == 2);
-    REQUIRE(inbox.at("items").at(0).at("body") == "first");
-    REQUIRE(inbox.at("items").at(1).at("body") == "second");
+    // The newest first: what was asked last is what most likely still needs an answer.
+    REQUIRE(inbox.at("items").at(0).at("body") == "second");
+    REQUIRE(inbox.at("items").at(1).at("body") == "first");
     REQUIRE(inbox.at("items").at(0).at("your_receipt").at("status") == "read");
 
     const json scoped = f.core->messages.inbox(f.codex_one, {{"conversation_id", first_conversation}});

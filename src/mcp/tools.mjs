@@ -25,7 +25,7 @@ const urgent = z
 // removed or the parameters of one change, together with kToolContract in
 // src/core/control_service.hpp. A client keeps the bridge it started with, so
 // this is how the console recognises one that has to be restarted.
-export const TOOL_CONTRACT = 6;
+export const TOOL_CONTRACT = 7;
 
 const toWindows = z
   .array(z.string().min(1))
@@ -36,6 +36,7 @@ const toWindows = z
 export const SERVER_INSTRUCTIONS = [
   'Shared conversation service where several AI sessions and a human operator work on the same tasks.',
   'At the start of every turn call check_in: it returns each conversation\'s overall goal, its task board and the messages written by others since your last check. Act on what concerns you before continuing with the user\'s request.',
+  'Handle messages addressed to you first: whenever check_in returns awaiting_your_reply (direct messages, single-session messages, or messages naming your window), reply in the originating conversation or call acknowledge_message before moving on to other work. Pending items reappear on every check_in until answered or acknowledged.',
   'If check_in fails with NOT_PAIRED, call request_pairing with your client kind and working directory, then call check_in again. Only if the session is still not active afterwards, ask the user to approve it in the operator console.',
   'By default every connected session of the project shares the conversation whose kind is "lobby": use it for anything all sessions should see. To talk to one session only, call direct_message with its session id from project_sessions; that conversation is private to the two of you and shows up in check_in with kind "direct".',
   'Coordinate through the board: create_task for new work, update_task with assignee_session_id "me" before you start something, and update_task with status done and a short note when you finish.',
@@ -98,12 +99,13 @@ export const TOOLS = [
   {
     name: 'read_messages',
     title: 'Read messages',
-    description: 'Messages visible to this session with sequence greater than after_seq, oldest first. Continue from next_cursor while has_more is true. next_cursor never exceeds last_seq.',
+    description: 'Read full message bodies from one conversation. Pass message_ids (1-10) to fetch specific truncated messages, pass after_seq to paginate forward oldest first using next_cursor while has_more is true, or omit both to fetch the newest messages (starting at first_seq). Pages stop early around 48 KB of text, setting has_more when additional messages remain.',
     readOnly: false,
     input: {
       conversation_id: conversationId,
-      after_seq: z.number().int().min(0).optional().describe('Last sequence already read; 0 or omitted reads from the start'),
+      after_seq: z.number().int().min(0).optional().describe('Sequence number already read (pass 0 to start from the beginning). Omit to retrieve the newest messages.'),
       limit: z.number().int().min(1).max(200).optional().describe('Page size, default 50'),
+      message_ids: z.array(z.string().min(1).max(96)).min(1).max(10).optional().describe('Specific message IDs (1 to 10) from this conversation to retrieve in full.'),
     },
   },
   {
@@ -153,7 +155,7 @@ export const TOOLS = [
   {
     name: 'get_inbox',
     title: 'Get inbox',
-    description: 'Messages addressed to this session that it has not acknowledged yet, oldest first.',
+    description: 'Unacknowledged messages addressed to this session, newest first. Pages stop early around 48 KB of text; acknowledge handled messages to advance through the queue.',
     readOnly: false,
     input: {
       conversation_id: conversationId.optional(),

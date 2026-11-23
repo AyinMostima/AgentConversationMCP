@@ -450,7 +450,7 @@ async function seed() {
   for (const client of Object.values(clients)) {
     await client.close().catch(() => undefined);
   }
-  await admin('PUT', '/api/v1/settings', { message_rate_per_minute: 12, message_rate_per_hour: 120 });
+  await admin('PUT', '/api/v1/settings', { message_rate_per_minute: 60, message_rate_per_hour: 600 });
   console.log(`[OK] demo data created (lang=${lang}): DATA-014, lobby, direct thread, tasks, bot requests, and pending approvals`);
 }
 

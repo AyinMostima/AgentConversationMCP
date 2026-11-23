@@ -141,7 +141,7 @@ describe('client hooks and urgent delivery', { concurrency: false }, () => {
     assert.equal((await hook('claude', 'prompt', { session_id: 'claude-conv-1' })).stdout, '');
     // Shown is not read: check_in still returns both.
     const caught = (await cli('claude', 'call', 'check_in')).conversations.find((entry) => entry.kind === 'lobby').new_messages;
-    assert.deepEqual(caught.map((message) => [message.body, message.urgent]), [[body, false], ['schema changed', true]]);
+    assert.deepEqual(caught.map((message) => [message.body, message.urgent === true]), [[body, false], ['schema changed', true]]);
 
     // A session start uses the other event name; Codex shares the contract.
     await say('claude', 'claude says hi');

@@ -184,6 +184,6 @@ describe('windows', { concurrency: false }, () => {
     const renamed = await service.admin('PUT', `/api/v1/windows/${entry.windows.find((window) => window.name === 'hy').window_id}`, { name: 'hybrid' });
     assert.equal(renamed.name, 'hybrid');
     assert.equal((await call(codex, 'check_in', {}, hy)).result.window.name, 'hybrid');
-    assert.equal(state.tool_contract, 6);
+    assert.equal(state.tool_contract, 7);
   });
 });

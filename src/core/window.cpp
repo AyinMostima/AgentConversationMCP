@@ -252,6 +252,51 @@ json Windows::rename(const Session& session, const Window& window, const json& a
     });
 }
 
+std::vector<std::string> Windows::waiting_ids(std::string_view session_id, std::string_view window_id,
+                                              std::int64_t limit, std::int64_t waited_seconds) {
+    Statement rows = database_.query(
+        "SELECT m.message_id FROM messages m "
+        "JOIN conversations c ON c.conversation_id = m.conversation_id AND c.status = 'open' "
+        "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.session_id = ?1 "
+        "WHERE cm.removed_at IS NULL AND cm.can_read = 1 "
+        "AND m.kind IN ('message', 'handoff', 'decision') AND m.context >= 0 AND m.created_at >= ?3 "
+        "AND m.created_at <= ?5 "
+        "AND NOT EXISTS (SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?1 "
+        "                AND r.acknowledged_at IS NOT NULL) "
+        "AND ("
+        // From another session: its direct conversation, or for this session alone, or naming this window.
+        " (COALESCE(m.sender_session_id, '') <> ?1 AND ("
+        "   (c.kind = 'direct' AND NOT EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id) "
+        // A direct conversation belongs to the windows of this session that write in it; when
+        // none of them can be told, or the caller's window is not known, to all of them.
+        "    AND (?2 = '' "
+        "     OR EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = m.conversation_id AND o.author_window_id = ?2) "
+        "     OR NOT EXISTS (SELECT 1 FROM messages o JOIN windows ow ON ow.window_id = o.author_window_id "
+        "                    WHERE o.conversation_id = m.conversation_id AND ow.session_id = ?1))) "
+        "   OR (c.kind <> 'direct' AND m.directed = 1 "
+        "    AND NOT EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id) "
+        "    AND EXISTS (SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?1)) "
+        "   OR (?2 <> '' AND EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id AND t.window_id = ?2)))) "
+        // From another window of the same application, naming this one.
+        " OR (m.sender_session_id = ?1 AND ?2 <> '' AND m.author_window_id IS NOT NULL AND m.author_window_id <> ?2 "
+        "     AND EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id AND t.window_id = ?2))) "
+        // Answered: this reader wrote there afterwards. Where a window is named, it is that
+        // window that has to (or one that cannot be told apart from it).
+        "AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = m.conversation_id AND o.seq > m.seq "
+        "                AND o.sender_session_id = ?1 "
+        "                AND (NOT EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id) "
+        "                     OR o.author_window_id = ?2 "
+        "                     OR (o.author_window_id IS NULL AND COALESCE(m.sender_session_id, '') <> ?1))) "
+        "ORDER BY m.rowid DESC LIMIT ?4",
+        session_id, window_id, to_rfc3339(clock_() - std::chrono::seconds(kWaitingSeconds)), limit,
+        to_rfc3339(clock_() - std::chrono::seconds(waited_seconds)));
+    std::vector<std::string> ids;
+    while (rows.step()) {
+        ids.push_back(rows.text(0));
+    }
+    return ids;
+}
+
 json Windows::wanting_model() {
     json windows = json::array();
     Statement rows = database_.query(

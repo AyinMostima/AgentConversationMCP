@@ -279,7 +279,7 @@ describe('command-line entry and bot control', { concurrency: false }, () => {
     assert.equal(echo.result.duplicate_suppressed, true);
 
     const settings = await service.admin('PUT', '/api/v1/settings', { message_rate_per_minute: 3 });
-    assert.deepEqual([settings.open_mode, settings.message_rate_per_minute, settings.message_rate_per_hour], [true, 3, 120]);
+    assert.deepEqual([settings.open_mode, settings.message_rate_per_minute, settings.message_rate_per_hour], [true, 3, 600]);
     const send = (index) => cli('codex', 'call', 'send_message', '--arg', `conversation_id=${lobby}`, '--str', `body=round ${index}`, '--str', `idempotency_key=flood-${index}`);
     for (const index of [1, 2, 3]) {
       assert.equal((await send(index)).code, 0);
@@ -306,7 +306,7 @@ describe('command-line entry and bot control', { concurrency: false }, () => {
       await service.admin('POST', `/api/v1/conversations/${lobby}/messages`, { body: `operator ${index}` });
     }
     await assert.rejects(service.admin('PUT', '/api/v1/settings', { message_rate_per_minute: -1 }), { code: 'INVALID_ARGUMENT' });
-    await service.admin('PUT', '/api/v1/settings', { message_rate_per_minute: 12 });
+    await service.admin('PUT', '/api/v1/settings', { message_rate_per_minute: 60 });
     note('flood-control', { duplicateText: 'one message', limitPerMinute: 3, fourth: 'RATE_LIMITED', retryAfterSeconds: refused.document.error.details.retry_after_seconds, replayNotCounted: true, operatorLimited: false });
   });
 

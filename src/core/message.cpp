@@ -358,24 +358,95 @@ json Messages::by_sender(std::string_view sender, const json& args) {
             {"total", total.integer(0)}};
 }
 
-json Messages::read(const Session& session, const json& args) {
-    const auto conversation_id = require_string(args, "conversation_id", 96);
-    const auto after_seq = optional_integer(args, "after_seq", 0, 0, INT64_MAX);
-    const auto limit = optional_integer(args, "limit", kDefaultPage, 1, kMaxPage);
+namespace {
+
+// Cuts the text of a message to `allowed` bytes, on a character boundary, and says so.
+// Returns how many bytes of text the message now carries.
+std::size_t shorten(json& message, std::size_t allowed) {
+    if (!message.contains("body") || !message.at("body").is_string()) {
+        return 0;
+    }
+    std::string body = message.at("body").get<std::string>();
+    if (body.size() <= allowed) {
+        return body.size();
+    }
+    std::size_t end = allowed;
+    while (end > 0 && (static_cast<unsigned char>(body[end]) & 0xC0) == 0x80) {
+        --end;
+    }
+    body.resize(end);
+    message["body"] = body + " [... cut; read_messages has the rest]";
+    message["cut"] = true;
+    return end;
+}
+
+// A message as check_in lists it: what a reader acts on. The whole record (the receipts of
+// every reader, empty fields, the ids of the agent and its vendor) is what read_messages
+// and the console show; here it would be most of what a reader has to take in.
+void slim(json& message) {
+    for (const char* key : {"payload", "forwarded_from", "reply_to_message_id", "context", "from_window"}) {
+        if (message.contains(key) && message.at(key).is_null()) {
+            message.erase(key);
+        }
+    }
+    for (const char* key : {"directed", "urgent"}) {
+        if (message.contains(key) && message.at(key) == json(false)) {
+            message.erase(key);
+        }
+    }
+    message.erase("recipients");
+    message.erase("conversation_id");
+    if (message.contains("your_receipt")) {
+        const bool acknowledged = message.at("your_receipt").is_object() &&
+                                  message.at("your_receipt").value("status", std::string()) == "acknowledged";
+        message.erase("your_receipt");
+        if (acknowledged) {
+            message["acknowledged"] = true;
+        }
+    }
+    if (message.contains("sender") && message.at("sender").is_object()) {
+        json& sender = message.at("sender");
+        sender.erase("agent_id");
+        sender.erase("provider");
+        for (const char* key : {"model", "label", "display_name", "session_id"}) {
+            if (sender.contains(key) && sender.at(key).is_null()) {
+                sender.erase(key);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+json Messages::page(const Session& session, std::string_view conversation_id, std::int64_t after_seq,
+                    std::int64_t limit, std::size_t max_bytes) {
     return database_.transaction([&] {
         const Access access = conversations_.require_reader(session, conversation_id);
-        std::vector<std::pair<std::string, std::int64_t>> page;
+        struct Row {
+            std::string id;
+            std::int64_t seq;
+        };
+        std::vector<Row> rows_found;
         Statement rows = database_.query(
-            "SELECT m.message_id, m.seq FROM messages m WHERE m.conversation_id = ? AND m.seq > ? AND "
-            "(m.directed = 0 OR m.sender_session_id = ? OR EXISTS (SELECT 1 FROM message_recipients r "
+            "SELECT m.message_id, m.seq, length(CAST(m.body AS BLOB)) FROM messages m WHERE m.conversation_id = ? "
+            "AND m.seq > ? AND (m.directed = 0 OR m.sender_session_id = ? OR EXISTS (SELECT 1 FROM message_recipients r "
             "WHERE r.message_id = m.message_id AND r.session_id = ?)) ORDER BY m.seq LIMIT ?",
             conversation_id, after_seq, session.session_id, session.session_id, limit + 1);
+        bool has_more = false;
+        std::size_t held = 0;
         while (rows.step()) {
-            page.emplace_back(rows.text(0), rows.integer(1));
-        }
-        const bool has_more = static_cast<std::int64_t>(page.size()) > limit;
-        if (has_more) {
-            page.pop_back();
+            if (static_cast<std::int64_t>(rows_found.size()) == limit) {
+                has_more = true;
+                break;
+            }
+            // A page that holds enough text ends here; the next one goes on from next_cursor.
+            const auto bytes = static_cast<std::size_t>(rows.integer(2));
+            if (max_bytes > 0 && !rows_found.empty() && held + bytes > max_bytes) {
+                has_more = true;
+                break;
+            }
+            held += bytes;
+            rows_found.push_back({rows.text(0), rows.integer(1)});
         }
         Statement last = database_.query("SELECT next_seq - 1 FROM conversations WHERE conversation_id = ?",
                                          conversation_id);
@@ -383,8 +454,8 @@ json Messages::read(const Session& session, const json& args) {
         const std::int64_t last_seq = last.integer(0);
 
         std::vector<std::string> ids;
-        for (const auto& entry : page) {
-            ids.push_back(entry.first);
+        for (const auto& entry : rows_found) {
+            ids.push_back(entry.id);
         }
         mark_read(session, ids, conversation_id, access.project_id);
         json messages = json::array();
@@ -394,13 +465,73 @@ json Messages::read(const Session& session, const json& args) {
         // With nothing further visible the cursor jumps to the end, past messages
         // hidden from this caller, and never beyond it: an after_seq larger than
         // anything stored must not make later messages look already read.
-        const std::int64_t next_cursor = has_more ? page.back().second : last_seq;
+        const std::int64_t next_cursor = has_more ? rows_found.back().seq : last_seq;
         return json{{"conversation_id", conversation_id},
                     {"messages", messages},
                     {"next_cursor", next_cursor},
                     {"has_more", has_more},
                     {"last_seq", last_seq}};
     });
+}
+
+json Messages::read(const Session& session, const json& args) {
+    const auto conversation_id = require_string(args, "conversation_id", 96);
+    const auto limit = optional_integer(args, "limit", kDefaultPage, 1, kMaxPage);
+    // Single messages, in full: what a reader asks for when it was given an overview.
+    if (args.contains("message_ids") && !args.at("message_ids").is_null()) {
+        const auto wanted = optional_string_list(args, "message_ids");
+        if (wanted.empty() || wanted.size() > 10) {
+            fail("INVALID_ARGUMENT", "message_ids takes 1 to 10 message ids");
+        }
+        return database_.transaction([&] {
+            const Access access = conversations_.require_reader(session, conversation_id);
+            std::vector<std::string> ids;
+            for (const auto& id : wanted) {
+                Statement row = database_.query(
+                    "SELECT 1 FROM messages m WHERE m.message_id = ? AND m.conversation_id = ? AND (m.directed = 0 OR "
+                    "m.sender_session_id = ? OR EXISTS (SELECT 1 FROM message_recipients r WHERE r.message_id = "
+                    "m.message_id AND r.session_id = ?))",
+                    id, conversation_id, session.session_id, session.session_id);
+                if (!row.step()) {
+                    fail("NOT_FOUND", std::format("message {} is not visible in this conversation", id));
+                }
+                ids.push_back(id);
+            }
+            mark_read(session, ids, conversation_id, access.project_id);
+            json messages = json::array();
+            for (const auto& id : ids) {
+                messages.push_back(message_view(id, &session));
+            }
+            return json{{"conversation_id", conversation_id}, {"messages", messages}, {"by_message_ids", true}};
+        });
+    }
+    if (args.contains("after_seq") && !args.at("after_seq").is_null()) {
+        return page(session, conversation_id, optional_integer(args, "after_seq", 0, 0, INT64_MAX), limit, kPageBytes);
+    }
+    // No place named: the newest messages, as many as fit a page. The beginning of a long
+    // conversation is the last thing a reader needs; after_seq 0 still reads from there.
+    conversations_.require_reader(session, conversation_id);
+    Statement newest = database_.query(
+        "SELECT m.seq, length(CAST(m.body AS BLOB)) FROM messages m WHERE m.conversation_id = ? AND (m.directed = 0 OR "
+        "m.sender_session_id = ? OR EXISTS (SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND "
+        "r.session_id = ?)) ORDER BY m.seq DESC LIMIT ?",
+        conversation_id, session.session_id, session.session_id, limit);
+    std::int64_t first = 0;
+    std::int64_t count = 0;
+    std::size_t held = 0;
+    while (newest.step()) {
+        const auto bytes = static_cast<std::size_t>(newest.integer(1));
+        if (count > 0 && held + bytes > kPageBytes) {
+            break;
+        }
+        held += bytes;
+        first = newest.integer(0);
+        ++count;
+    }
+    json result = page(session, conversation_id, first > 0 ? first - 1 : 0, limit, 0);
+    // Where this page begins, when the conversation has more before it.
+    result["first_seq"] = first;
+    return result;
 }
 
 json Messages::inbox(const Session& session, const json& args) {
@@ -414,22 +545,32 @@ json Messages::inbox(const Session& session, const json& args) {
         };
         std::vector<Pending> pending;
         // Only conversations the caller can still read; losing membership hides the backlog.
+        // The newest first: what was asked last is what most likely still needs an answer.
         Statement rows = database_.query(
-            "SELECT m.message_id, m.conversation_id, c.project_id FROM message_recipients r "
+            "SELECT m.message_id, m.conversation_id, c.project_id, length(CAST(m.body AS BLOB)) FROM message_recipients r "
             "JOIN messages m ON m.message_id = r.message_id "
             "JOIN conversations c ON c.conversation_id = m.conversation_id AND c.status = 'open' "
             "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.session_id = r.session_id "
             "WHERE r.session_id = ? AND r.status <> 'acknowledged' AND cm.removed_at IS NULL AND cm.can_read = 1 "
             // What compacting dropped or resolved is no longer anybody's to answer.
             "AND m.context >= 0 "
-            "AND (? IS NULL OR m.conversation_id = ?) ORDER BY m.created_at, m.conversation_id, m.seq LIMIT ?",
+            "AND (? IS NULL OR m.conversation_id = ?) ORDER BY m.rowid DESC LIMIT ?",
             session.session_id, only_conversation, only_conversation, limit + 1);
+        bool has_more = false;
+        std::size_t held = 0;
         while (rows.step()) {
+            if (static_cast<std::int64_t>(pending.size()) == limit) {
+                has_more = true;
+                break;
+            }
+            // A page that holds enough text ends here; acknowledge what was dealt with to see the rest.
+            const auto bytes = static_cast<std::size_t>(rows.integer(3));
+            if (!pending.empty() && held + bytes > kPageBytes) {
+                has_more = true;
+                break;
+            }
+            held += bytes;
             pending.push_back({rows.text(0), rows.text(1), rows.text(2)});
-        }
-        const bool has_more = static_cast<std::int64_t>(pending.size()) > limit;
-        if (has_more) {
-            pending.pop_back();
         }
         json items = json::array();
         for (const auto& entry : pending) {
@@ -565,9 +706,61 @@ json Messages::forward(const Session& session, const json& args) {
     });
 }
 
+json Messages::waiting_view(const Session& session, const std::vector<std::string>& ids, const Window* window) {
+    json waiting = json::array();
+    std::size_t left = kWaitingTotalBytes;
+    for (const auto& id : ids) {
+        const json view = message_view(id, &session);
+        Statement place = database_.query("SELECT kind, title FROM conversations WHERE conversation_id = ?",
+                                          view.at("conversation_id").get<std::string>());
+        place.step();
+        const std::string kind = place.text(0);
+        const bool named = window != nullptr && std::ranges::any_of(view.at("to_windows"), [&](const json& target) {
+            return target.at("window_id") == json(window->window_id);
+        });
+        json entry = {{"message_id", view.at("message_id")},
+                      {"conversation_id", view.at("conversation_id")},
+                      {"in", kind == "lobby" ? json("the lobby") : kind == "direct" ? json("a direct conversation with you") : json(place.text(1))},
+                      {"why", named ? "it names your window" : kind == "direct" ? "it is a direct message to you" : "it was sent to your session alone"},
+                      {"sequence", view.at("sequence")},
+                      {"created_at", view.at("created_at")},
+                      {"urgent", view.at("urgent")},
+                      {"from",
+                       {{"kind", view.at("sender").at("kind")},
+                        {"session_id", view.at("sender").at("session_id")},
+                        {"display_name", view.at("sender").at("display_name")},
+                        {"label", view.at("sender").at("label")},
+                        {"window", view.at("from_window").is_null() ? json(nullptr) : view.at("from_window").at("name")}}}};
+        std::string body = view.at("body").get<std::string>();
+        const std::size_t allowed = std::max(kWaitingReminderBytes, std::min(kWaitingBytes, left));
+        left -= std::min(left, std::min(body.size(), allowed));
+        if (body.size() > allowed) {
+            std::size_t end = allowed;
+            while (end > 0 && (static_cast<unsigned char>(body[end]) & 0xC0) == 0x80) {
+                --end;
+            }
+            body.resize(end);
+            body += " [... cut; read_messages has the rest]";
+            entry["cut"] = true;
+        }
+        entry["body"] = std::move(body);
+        waiting.push_back(std::move(entry));
+    }
+    // Oldest first: the order to answer them in.
+    std::reverse(waiting.begin(), waiting.end());
+    return waiting;
+}
+
 json Messages::unread(const Session& session, std::string_view conversation_id, std::int64_t limit,
-                      const Window* window) {
+                      const Window* window, std::size_t* budget) {
     conversations_.require_reader(session, conversation_id);
+    // What is left for the text of messages in this check-in; a caller without one gets a whole one.
+    std::size_t own_budget = kCheckInBytes;
+    std::size_t& left = budget != nullptr ? *budget : own_budget;
+    // In full, as far as the budget goes and never more than kFullBytes; never less than an overview.
+    const auto in_full = [&](json& message) {
+        left -= std::min(left, shorten(message, std::max(kOverviewBytes, std::min(kFullBytes, left))));
+    };
     // A window reads from its own place. It got one for every conversation of its
     // session when it was first seen; a conversation it has no place in yet was
     // joined later and is new to it from the start.
@@ -591,28 +784,71 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
     if (digested) {
         start = std::max(start, digest_seq);
     }
-    json page = read(session, {{"conversation_id", std::string(conversation_id)},
-                               {"after_seq", start},
-                               {"limit", limit}});
+    json page = this->page(session, conversation_id, start, limit, 0);
     advance_cursor(session, conversation_id, page.at("next_cursor").get<std::int64_t>(), window);
     if (digested) {
-        page["digest"] = conversations_.digest(conversation_id);
+        // The digest stands for many messages; it is one text of bounded size itself.
+        json digest = conversations_.digest(conversation_id);
+        if (digest.is_object() && digest.at("text").is_string() && digest.at("text").get<std::string>().size() > kFullBytes) {
+            std::string text = digest.at("text").get<std::string>();
+            std::size_t end = kFullBytes;
+            while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+                --end;
+            }
+            text.resize(end);
+            digest["text"] = text + " [... cut; the console shows the whole digest]";
+            digest["cut"] = true;
+        }
+        page["digest"] = std::move(digest);
     }
     // Messages from before `start` that compacting kept in front of readers: they come along in full.
     if (start > read_upto) {
         json kept = json::array();
+        // So do messages that are for this reader alone (its session, or its window by
+        // name): how many others were written since never hides one of those.
         Statement rows = database_.query(
             "SELECT m.message_id FROM messages m WHERE m.conversation_id = ?1 AND m.seq > ?2 AND m.seq <= ?3 "
-            "AND m.context = 1 AND COALESCE(m.sender_session_id, '') <> ?4 AND (m.directed = 0 OR EXISTS "
-            "(SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?4)) "
-            "ORDER BY m.seq LIMIT 40",
-            conversation_id, read_upto, start, session.session_id);
+            "AND ((m.context = 1 AND COALESCE(m.sender_session_id, '') <> ?4 AND (m.directed = 0 OR EXISTS "
+            "(SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?4))) "
+            " OR (m.context >= 0 AND (?5 = '' OR COALESCE(m.author_window_id, '') <> ?5) AND ("
+            "  (?5 <> '' AND EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id AND t.window_id = ?5)) "
+            "  OR (COALESCE(m.sender_session_id, '') <> ?4 AND m.directed = 1 "
+            "      AND NOT EXISTS (SELECT 1 FROM message_windows t WHERE t.message_id = m.message_id) "
+            "      AND EXISTS (SELECT 1 FROM message_recipients r WHERE r.message_id = m.message_id AND r.session_id = ?4))))) "
+            "ORDER BY m.seq DESC LIMIT ?6",
+            conversation_id, read_upto, start, session.session_id,
+            window != nullptr ? window->window_id : std::string(), kKeptListed + 1);
         std::vector<std::string> ids;
         while (rows.step()) {
             ids.push_back(rows.text(0));
         }
+        // The newest of them; how many older ones there are is said, not shown.
+        const bool more_kept = static_cast<std::int64_t>(ids.size()) > kKeptListed;
+        if (more_kept) {
+            ids.pop_back();
+        }
+        const std::string fresh_since = to_rfc3339(clock_() - std::chrono::seconds(kKeptFreshSeconds));
         for (const auto& id : ids) {
-            kept.push_back(message_view(id, &session));
+            json message = message_view(id, &session);
+            const bool names_reader = window != nullptr && std::ranges::any_of(message.at("to_windows"), [&](const json& target) {
+                return target.at("window_id") == json(window->window_id);
+            });
+            // In full: what is for this reader, and what was kept for everybody not long ago.
+            // An overview: what names other windows, and what was written a day or more ago
+            // (the reader is told that it is there and can ask for it).
+            const bool for_everybody = message.at("to_windows").empty();
+            const bool fresh = message.at("created_at").get<std::string>() >= fresh_since;
+            if (names_reader || (for_everybody && (fresh || message.value("directed", false)))) {
+                in_full(message);
+            } else {
+                shorten(message, kOverviewBytes);
+            }
+            slim(message);
+            kept.push_back(std::move(message));
+        }
+        std::reverse(kept.begin(), kept.end());
+        if (more_kept) {
+            page["kept_not_listed"] = true;
         }
         if (!kept.empty()) {
             page["kept_messages"] = std::move(kept);
@@ -623,7 +859,9 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
     // The caller already knows what it sent itself. What another window of the
     // same session wrote is news to it, as far as the two can be told apart.
     json others = json::array();
-    for (auto& message : page.at("messages")) {
+    // The newest first, so that the budget goes to what was written last.
+    for (auto it = page.at("messages").rbegin(); it != page.at("messages").rend(); ++it) {
+        json& message = *it;
         const bool same_session = message.at("sender").at("session_id") == json(session.session_id);
         const json& author = message.at("from_window");
         const bool told_apart = window != nullptr && !author.is_null();
@@ -644,20 +882,15 @@ json Messages::unread(const Session& session, std::string_view conversation_id, 
         const bool for_reader = named || direct || message.value("directed", false) ||
                                 (message.value("urgent", false) && message.at("to_windows").empty()) ||
                                 message.at("context") == json("kept");
-        if (!for_reader && message.at("body").is_string()) {
-            std::string body = message.at("body").get<std::string>();
-            if (body.size() > kOverviewBytes) {
-                std::size_t end = kOverviewBytes;
-                while (end > 0 && (static_cast<unsigned char>(body[end]) & 0xC0) == 0x80) {
-                    --end;
-                }
-                body.resize(end);
-                message["body"] = body + " [... cut; read_messages has the rest]";
-                message["cut"] = true;
-            }
+        if (for_reader) {
+            in_full(message);
+        } else {
+            shorten(message, kOverviewBytes);
         }
+        slim(message);
         others.push_back(std::move(message));
     }
+    std::reverse(others.begin(), others.end());
     page["messages"] = std::move(others);
     return page;
 }

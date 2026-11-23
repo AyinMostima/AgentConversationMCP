@@ -22,9 +22,14 @@
 // which window a request is for.
 //
 // Claude needs none of this: its conversations become windows through its hooks.
+//
+// The same round also learns which model wrote the messages of conversations
+// that are not running any more (record.mjs): a running one says so through its
+// hooks, one that has ended never will.
 import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { recordPath, recordedModel } from './record.mjs';
 
 const DAY_MS = 24 * 3600 * 1000;
 const FIRST_LINE_LIMIT = 4 * 1024 * 1024;
@@ -194,8 +199,52 @@ export async function antigravityConversations({ env = process.env, sinceMs = Da
  * the local service; `say(line)` receives one-line diagnostics. Returns a
  * function that stops it.
  */
+/**
+ * Asks the core which windows wrote messages that carry no model, reads the
+ * model from each one's record and reports it. `state` is kept by the caller
+ * between calls: where Codex keeps its files, and which windows were looked at
+ * in vain (they are tried again after an hour). A conversation that has ended
+ * is read as far back as it takes, a few of them per call. Resolves to how many
+ * windows got a model.
+ */
+export async function labelModels({ coreUrl, adminToken, env = process.env, state = { index: new Map(), tried: new Map() }, now = Date.now() }) {
+  const headers = { 'content-type': 'application/json', 'x-acm-admin-token': adminToken() };
+  const asked = await (await fetch(`${coreUrl}/api/v1/windows/models`, { headers })).json();
+  if (!asked.ok) {
+    throw new Error(`${asked.error.code}: ${asked.error.message}`);
+  }
+  const models = [];
+  let looked = 0;
+  for (const window of asked.result.windows) {
+    if (now - (state.tried.get(window.window_id) ?? 0) < 3600 * 1000) {
+      continue;
+    }
+    if (looked === 12) {
+      // The rest in the next round: reading must not hold up everything else here.
+      break;
+    }
+    looked += 1;
+    await new Promise((done) => setImmediate(done));
+    const { model, since } = recordedModel(recordPath(window.client, window.client_session, { env, index: state.index }), { maxBytes: 512 * 1024 * 1024 });
+    if (model === undefined) {
+      state.tried.set(window.window_id, now);
+      continue;
+    }
+    models.push({ window_id: window.window_id, model, since });
+  }
+  if (models.length === 0) {
+    return 0;
+  }
+  const told = await (await fetch(`${coreUrl}/api/v1/windows/models`, { method: 'POST', headers, body: JSON.stringify({ models }) })).json();
+  if (!told.ok) {
+    throw new Error(`${told.error.code}: ${told.error.message}`);
+  }
+  return told.result.labelled;
+}
+
 export function startDiscovery({ coreUrl, adminToken, intervalMs = 60000, say, env = process.env }) {
   const known = new Map();
+  const labelling = { index: new Map(), tried: new Map() };
   let busy = false;
   let lastProblem = '';
 
@@ -225,6 +274,10 @@ export function startDiscovery({ coreUrl, adminToken, intervalMs = 60000, say, e
         if (envelope.result.retired > 0) {
           say(`${envelope.result.retired} ${client} sub-agent conversation(s) are no longer listed as windows`);
         }
+      }
+      const labelled = await labelModels({ coreUrl, adminToken, env, state: labelling });
+      if (labelled > 0) {
+        say(`${labelled} conversation(s) got their model name from the clients' records`);
       }
       lastProblem = '';
     } catch (error) {

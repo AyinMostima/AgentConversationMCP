@@ -227,16 +227,44 @@ json Messages::submit(const Author& author, const Draft& draft,
         database_.execute("UPDATE conversations SET next_seq = next_seq + 1 WHERE conversation_id = ?",
                           draft.conversation_id);
 
+        // Which model writes this. A window is known by its own model and never takes that
+        // of another window: windows of one application may run different models.
+        std::optional<std::string> model;
+        if (draft.author_window_id) {
+            Statement own = database_.query("SELECT model FROM windows WHERE window_id = ?", *draft.author_window_id);
+            if (own.step()) {
+                model = own.optional_text(0);
+            }
+        } else if (author.session != nullptr) {
+            // No window is known for the call (some clients name the conversation only in
+            // their hooks). When the windows of this application that were at work in the last
+            // minutes all run one model, it is that one; otherwise what the application said itself.
+            Statement recent = database_.query(
+                "SELECT DISTINCT model FROM windows WHERE session_id = ? AND model IS NOT NULL AND seen_at >= ? LIMIT 2",
+                sender_id, to_rfc3339(moment - std::chrono::seconds(180)));
+            std::vector<std::string> at_work;
+            while (recent.step()) {
+                at_work.push_back(recent.text(0));
+            }
+            if (at_work.size() == 1) {
+                model = at_work.front();
+            } else {
+                Statement said = database_.query("SELECT model FROM agent_sessions WHERE session_id = ?", sender_id);
+                if (said.step()) {
+                    model = said.optional_text(0);
+                }
+            }
+        }
         const std::string id = new_id("msg");
         database_.execute(
             "INSERT INTO messages (message_id, conversation_id, seq, sender_kind, sender_session_id, kind, body, "
             "payload, reply_to_message_id, directed, idempotency_key, request_hash, created_at, urgent, "
-            "author_window_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "author_window_id, author_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id, draft.conversation_id, seq, sender_kind,
             author.session != nullptr ? std::optional<std::string>(sender_id) : std::nullopt, draft.kind, draft.body,
             draft.payload.is_null() ? std::optional<std::string>() : std::optional<std::string>(draft.payload.dump()),
             draft.reply_to_message_id, !explicit_recipients.empty(), draft.idempotency_key, hash, now, urgent,
-            draft.author_window_id);
+            draft.author_window_id, model);
         for (const auto& target : draft.to_windows) {
             database_.execute("INSERT INTO message_windows (message_id, window_id) VALUES (?, ?)", id, target.window_id);
         }
@@ -286,6 +314,48 @@ json Messages::submit(const Author& author, const Draft& draft,
     // P1 stores and shares only. Pushing into a running turn needs an approved delivery (P2/P3).
     result["delivery"] = {{"action", "shared_only"}, {"approval", "not_required"}};
     return result;
+}
+
+json Messages::by_sender(std::string_view sender, const json& args) {
+    const auto limit = optional_integer(args, "limit", 40, 1, 200);
+    const auto before = optional_integer(args, "before", INT64_MAX, 1, INT64_MAX);
+    // "operator": what was written at the console. Otherwise an agent: all its sessions and windows.
+    const bool console = sender == "operator";
+    std::vector<std::pair<std::string, std::int64_t>> found;
+    Statement rows = console
+        ? database_.query("SELECT m.message_id, m.rowid FROM messages m WHERE m.sender_kind = 'operator' AND m.rowid < ? "
+                          "ORDER BY m.rowid DESC LIMIT ?",
+                          before, limit + 1)
+        : database_.query("SELECT m.message_id, m.rowid FROM messages m JOIN agent_sessions s ON s.session_id = "
+                          "m.sender_session_id WHERE s.agent_id = ? AND m.rowid < ? ORDER BY m.rowid DESC LIMIT ?",
+                          sender, before, limit + 1);
+    while (rows.step()) {
+        found.emplace_back(rows.text(0), rows.integer(1));
+    }
+    const bool has_more = static_cast<std::int64_t>(found.size()) > limit;
+    if (has_more) {
+        found.pop_back();
+    }
+    json messages = json::array();
+    for (const auto& [id, rowid] : found) {
+        json view = message_view(id, nullptr);
+        // Where it was said, for a list that spans conversations.
+        Statement place = database_.query(
+            "SELECT kind, title, task_code, status FROM conversations WHERE conversation_id = ?",
+            view.at("conversation_id").get<std::string>());
+        place.step();
+        view["conversation"] = {{"kind", place.text(0)}, {"title", place.text(1)}, {"task_code", place.text(2)}, {"status", place.text(3)}};
+        messages.push_back(std::move(view));
+    }
+    Statement total = console
+        ? database_.query("SELECT COUNT(*) FROM messages WHERE sender_kind = 'operator'")
+        : database_.query("SELECT COUNT(*) FROM messages m JOIN agent_sessions s ON s.session_id = m.sender_session_id "
+                          "WHERE s.agent_id = ?", sender);
+    total.step();
+    return {{"messages", messages},
+            {"has_more", has_more},
+            {"next_before", found.empty() ? json(nullptr) : json(found.back().second)},
+            {"total", total.integer(0)}};
 }
 
 json Messages::read(const Session& session, const json& args) {
@@ -672,7 +742,7 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
     Statement row = database_.query(
         "SELECT m.message_id, m.conversation_id, m.seq, m.sender_kind, m.sender_session_id, m.kind, m.body, "
         "m.payload, m.reply_to_message_id, m.directed, m.created_at, s.agent_id, s.label, a.provider, "
-        "a.display_name, m.forwarded_from, m.urgent, m.author_window_id, w.name, m.context FROM messages m "
+        "a.display_name, m.forwarded_from, m.urgent, m.author_window_id, w.name, m.context, m.author_model FROM messages m "
         "LEFT JOIN agent_sessions s ON s.session_id = m.sender_session_id "
         "LEFT JOIN agents a ON a.agent_id = s.agent_id "
         "LEFT JOIN windows w ON w.window_id = m.author_window_id WHERE m.message_id = ?",
@@ -697,7 +767,9 @@ json Messages::message_view(std::string_view message_id, const Session* viewer) 
                    {"agent_id", nullable(row.optional_text(11))},
                    {"label", nullable(row.optional_text(12))},
                    {"provider", nullable(row.optional_text(13))},
-                   {"display_name", nullable(row.optional_text(14))}}}};
+                   {"display_name", nullable(row.optional_text(14))},
+                   // The model that wrote it, as far as it was known then.
+                   {"model", nullable(row.optional_text(20))}}}};
     // The window that wrote it, when known, and the windows it is meant for; empty means all of them.
     // Whether compacting kept it in front of readers, or took it out of what is read into a context.
     view["context"] = row.integer(19) > 0     ? json("kept")

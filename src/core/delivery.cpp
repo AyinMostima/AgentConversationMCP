@@ -252,6 +252,7 @@ json Delivery::hook(const Session& session, const json& args) {
                 "WHERE window_id = ?",
                 event == "tool" ? std::string("prompt") : event, now, client, client, client, cwd, window.window_id);
         }
+        windows_.note_model(session, &window, optional_string(args, "model", 200), optional_string(args, "model_since", 40));
         if (persistent) {
             database_.execute("UPDATE windows SET addressable = ? WHERE window_id = ?",
                               static_cast<std::int64_t>(*persistent ? 1 : 0), window.window_id);

@@ -180,8 +180,18 @@ export interface Message {
     label: string | null;
     provider: string | null;
     display_name: string | null;
+    /** The model that wrote it, as far as it was known when it was written. */
+    model: string | null;
   };
   recipients: Receipt[];
+}
+
+/** What one sender wrote, newest first, across conversations. */
+export interface SenderHistory {
+  messages: (Message & { conversation: { kind: Conversation['kind']; title: string; task_code: string; status: Conversation['status'] } })[];
+  has_more: boolean;
+  next_before: number | null;
+  total: number;
 }
 
 export interface MessagePage {
@@ -277,6 +287,8 @@ export interface WindowInfo {
   last_active_at: string;
   cwd: string | null;
   is_you: boolean;
+  /** Which model is at work there, when it is known. */
+  model?: string | null;
   /** What its client shows as the title of the conversation, when known. */
   title: string | null;
   /** Known from its client's own record only; woken when a message names it. */
@@ -411,6 +423,8 @@ export interface Api {
     members: { session_id: string; can_read: boolean; can_write: boolean }[],
   ): Promise<Conversation>;
   messages(conversationId: string, afterSeq: number, limit: number): Promise<MessagePage>;
+  /** `sender` is an agent id, or "operator". */
+  senderMessages(sender: string, before: number | null): Promise<SenderHistory>;
   sendMessage(
     conversationId: string,
     body: { body: string; kind: string; recipient_session_ids?: string[]; urgent?: boolean; to_windows?: string[]; idempotency_key: string },
@@ -475,6 +489,7 @@ export function createApi(token: string): Api {
     setMembers: (id, expectedVersion, members) =>
       request('PUT', `/api/v1/conversations/${id}/members`, { expected_version: expectedVersion, members }),
     messages: (id, afterSeq, limit) => request('GET', `/api/v1/conversations/${id}/messages?after_seq=${afterSeq}&limit=${limit}`),
+    senderMessages: (sender, before) => request('GET', `/api/v1/agents/${encodeURIComponent(sender)}/messages?limit=40${before === null ? '' : `&before=${before}`}`),
     sendMessage: (id, body) => request('POST', `/api/v1/conversations/${id}/messages`, body),
     updateConversation: (id, body) => request('PUT', `/api/v1/conversations/${id}`, body),
     clearConversation: (id, olderThanDays) => request('POST', `/api/v1/conversations/${id}/clear`, olderThanDays > 0 ? { older_than_days: olderThanDays } : {}),

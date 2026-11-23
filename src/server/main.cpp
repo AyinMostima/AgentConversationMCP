@@ -550,6 +550,15 @@ private:
         if (resource == "sessions" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("set_session", path[3], parse_body(request)));
         }
+        // Everything one application (or the operator, as "operator") wrote, newest first.
+        if (resource == "agents" && path.size() == 5 && is(4, "messages") && method == drogon::Get) {
+            json paging = json::object();
+            paging["limit"] = integer_parameter(request, "limit", 40);
+            if (const auto before = integer_parameter(request, "before", 0); before > 0) {
+                paging["before"] = before;
+            }
+            return ok(service_.admin("sender_messages", path[3], paging));
+        }
         if (resource == "agents" && path.size() == 4 && method == drogon::Put) {
             return ok(service_.admin("update_agent", path[3], parse_body(request)));
         }
@@ -582,6 +591,14 @@ private:
         // The operator compacts a conversation: digest, messages to keep, messages to drop.
         if (resource == "conversations" && path.size() == 5 && is(4, "compact") && method == drogon::Post) {
             return ok(service_.admin("compact_conversation", path[3], parse_body(request)));
+        }
+        // Which windows wrote messages without a model name, and what the gateway read
+        // about them in the clients' own records.
+        if (resource == "windows" && path.size() == 4 && is(3, "models") && method == drogon::Get) {
+            return ok(service_.admin("windows_wanting_model", "", json::object()));
+        }
+        if (resource == "windows" && path.size() == 4 && is(3, "models") && method == drogon::Post) {
+            return ok(service_.admin("label_models", "", parse_body(request)));
         }
         // Conversations the gateway found on a client's own record.
         if (resource == "windows" && path.size() == 4 && is(3, "import") && method == drogon::Post) {

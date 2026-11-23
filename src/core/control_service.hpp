@@ -53,7 +53,7 @@ public:
     // Version of the tool contract: raised whenever a tool is added or removed or
     // the parameters of one change. Must equal TOOL_CONTRACT in src/mcp/tools.mjs;
     // a bridge that reports another number was started before the change.
-    static constexpr int kToolContract = 5;
+    static constexpr int kToolContract = 6;
     int schema_version();
 
 private:

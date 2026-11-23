@@ -103,7 +103,7 @@ export function ProviderMark({ provider, size = 'md' }: { provider: string | nul
   const info = providerInfo(provider, t);
   const source = avatars.enabled ? avatarSource(avatarSlot(provider), avatars) : undefined;
   if (source !== undefined) {
-    return <img className={`mark mark-${size} mark-avatar`} src={source} alt="" aria-hidden="true" loading="lazy" draggable={false} />;
+    return <img className={`mark mark-${size} mark-avatar mark-ring-${info.tone}`} src={source} alt="" aria-hidden="true" loading="lazy" draggable={false} />;
   }
   return (
     <span className={`mark mark-${size}`} aria-hidden="true">

@@ -74,6 +74,23 @@ public:
     // window of the project holds the name.
     json rename(const Session& session, const Window& window, const json& args);
 
+    // What a client or a model said about which model is at work in a window (and,
+    // as a fallback for calls that belong to no window, in its session). Ignored
+    // when empty.
+    /// Records which model is at work in a window (or, for a client without windows, in its
+    /// session). The first time it is known, what was written there before gets it as well:
+    /// everything, or only what is not older than `since` when the client knows that the model
+    /// changed at that time.
+    /// Windows that wrote messages which carry no model, and whose client keeps a record
+    /// that may name it: {windows: [{window_id, client, client_session}]}.
+    json wanting_model();
+    /// What the gateway read from those records: {models: [{window_id, model, since?}]}.
+    json label_models(const json& args);
+    /// The model known for a window, or for the session of a client without windows.
+    std::optional<std::string> model_of(const Session& session, const Window* window);
+    void note_model(const Session& session, const Window* window, const std::optional<std::string>& model,
+                    const std::optional<std::string>& since = std::nullopt);
+
     // Operator: {name} for any window.
     json admin_rename(std::string_view window_id, const json& args);
 

@@ -33,6 +33,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveDataDir } from './paths.mjs';
+import { recordedModel } from './record.mjs';
 
 const CLIENTS = ['claude', 'codex', 'antigravity'];
 const EVENTS = ['start', 'prompt', 'stop', 'watch', 'tool'];
@@ -65,11 +66,19 @@ export function readInput(client, raw, event) {
     // No input, or not JSON: nothing is known about the conversation.
   }
   const text = (value) => (typeof value === 'string' && value !== '' ? value.slice(0, 250) : undefined);
+  // Which model runs the conversation. The client says so in its input (Codex with
+  // every hook, Claude only when a session starts); otherwise its own record of the
+  // conversation does, which names the model of every turn. A model object is named by its id.
+  const named = text(typeof input.model === 'object' && input.model !== null ? (input.model.id ?? input.model.name) : input.model) ?? text(input.modelId) ?? text(input.modelName);
+  const recorded = recordedModel(input.transcript_path);
+  const model = named ?? recorded.model;
+  // Known to have changed within the record: what was written before that is not this model's.
+  const modelSince = recorded.model === model ? recorded.since : undefined;
   if (client === 'antigravity') {
     const workspace = Array.isArray(input.workspacePaths) ? input.workspacePaths[0] : undefined;
-    return { clientSession: text(input.conversationId), cwd: text(input.cwd) ?? text(workspace) };
+    return { clientSession: text(input.conversationId), cwd: text(input.cwd) ?? text(workspace), model, modelSince };
   }
-  return { clientSession: text(input.session_id), cwd: text(input.cwd), persistent: client === 'codex' ? keeps(input, event) : undefined };
+  return { clientSession: text(input.session_id), cwd: text(input.cwd), model, modelSince, persistent: client === 'codex' ? keeps(input, event) : undefined };
 }
 
 /**
@@ -218,7 +227,7 @@ async function main() {
       const response = await fetch(`${coreUrl}/internal/v1/hook`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-        body: JSON.stringify({ client, client_session: input.clientSession, cwd: input.cwd, persistent: input.persistent, ...body }),
+        body: JSON.stringify({ client, client_session: input.clientSession, cwd: input.cwd, persistent: input.persistent, model: input.model, model_since: input.modelSince, ...body }),
         signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
       });
       const envelope = await response.json();

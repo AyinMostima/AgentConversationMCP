@@ -236,6 +236,9 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     if (operation == "create_agent") {
         return identity_.create_agent(args);
     }
+    if (operation == "sender_messages") {
+        return messages_.by_sender(target_id, args);
+    }
     if (operation == "update_agent") {
         return identity_.update_agent(target_id, args);
     }
@@ -500,6 +503,12 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
     }
     if (operation == "import_windows") {
         return windows_.import(args);
+    }
+    if (operation == "windows_wanting_model") {
+        return windows_.wanting_model();
+    }
+    if (operation == "label_models") {
+        return windows_.label_models(args);
     }
     if (operation == "compactions") {
         conversations_.get(target_id);
@@ -872,6 +881,8 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
     const auto only = optional_string(args, "conversation_id", 96);
     const auto limit = optional_integer(args, "limit", 15, 1, 200);
     const bool all_windows = optional_bool(args, "all_windows", false);
+    // The model says which model it is: not every client tells through its hooks.
+    windows_.note_model(session, window, optional_string(args, "model", 200));
     if (only) {
         conversations_.require_member(session, *only);
     }
@@ -929,10 +940,17 @@ json ControlService::check_in(const Session& session, const json& args, const Wi
     }
     // Outcomes of bot requests this session made, and requests waiting for it as a bot host.
     const json bot_news = bots_.news(session);
+    // Which model is at work here, as far as it is known. A client whose hooks do not say
+    // (or that has none) is asked to say so itself, once, with its next check-in.
+    const auto model = windows_.model_of(session, window);
     return {{"session_id", session.session_id},
             {"label", session.label},
             // The conversation this call comes from: its name is how others address it (to_windows).
             {"window", window != nullptr ? json{{"window_id", window->window_id}, {"name", window->name}} : json(nullptr)},
+            {"model", model ? json(*model) : json(nullptr)},
+            {"model_wanted", model ? json(nullptr)
+                                   : json("No model identifier is recorded for this window yet. Pass your exact runtime "
+                                          "model name as `model` on your next check_in; omit if unavailable and never guess.")},
             // The operator's standing rules for every session (set at the console, by the
             // person who runs these sessions; not a peer's message). Null when there are none.
             {"shared_rules", text_setting(database_, "shared_rules")

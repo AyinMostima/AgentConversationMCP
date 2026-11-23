@@ -273,6 +273,14 @@ Configure console display identities under **Settings > Avatars & Names**:
 - Toggle **Show avatars** (enabled by default) to switch between custom images and single-letter monograms across timelines and lists.
 - Click any avatar or **Change image** to upload a PNG, JPEG, WebP, or GIF file up to 16 MB. Uploads are stored unmodified under `%USERPROFILE%\.acm\avatars` and served directly at original resolution; click **Reset** to restore the built-in artwork.
 - Edit the display name beside any client or the operator row (clearing the operator field restores the default **Operator** label). Updated names sync across the console and peer session rosters, and editing is restricted to the operator console.
+- Each avatar is framed by a subtle ring tinted to its client color, inset padding, and a light drop shadow while preserving full portrait dimensions.
+
+### Models and Sender History
+
+- **Per-message model badges**: Each message displays the model active in its originating window (`sender.model`). Model IDs are tracked independently per window from client hook payloads, local Claude Code or Codex JSONL transcripts (`transcript_path` during hooks and periodic background lookups for closed conversations), or the `model` field on `check_in` (sessions with an unknown model receive a `model_wanted` prompt on `check_in`). When a window's model is recorded for the first time, earlier unlabeled messages from that window since any detected model switch inherit the tag automatically; subsequent model changes leave previously labeled messages intact.
+- **Calls without a window handle**: For clients whose tool calls omit a window identifier (such as Antigravity) or clients without windows (such as Grok Bot), messages inherit the model shared by all windows of that session active within the past three minutes when they agree, or fall back to the session-level `check_in` model.
+- **Cross-conversation sender history**: Click any avatar in a timeline to open a side drawer listing that client's (or the operator's) messages across all conversations in reverse chronological order, showing conversation title, window handle, model badge, and timestamp. Click an entry to expand the full text, or click the conversation title to jump directly to that thread. Backed by the operator-only endpoint `GET /api/v1/agents/{agent_id|operator}/messages?limit=&before=`.
+- **Latest-first timeline viewport**: Timelines anchor to the newest message whenever opened or revisited from the task board or another console tab, and follow incoming messages automatically until you scroll upward to read earlier context.
 
 ### Step 9: Keep Context Compact
 
@@ -337,6 +345,7 @@ When an idle window has no active in-process watcher, `src\mcp\dispatch.mjs` wak
 
 - **Unread state preserved**: Hooks inject context for visibility while leaving `check_in` cursors intact, preventing missed messages if a client drops hook output.
 - **Explicit attribution**: Injected blocks start with `[ACM]` and identify the peer agent or operator origin.
+- **Model reporting**: Hooks forward the active model from client hook payloads (`model` as a string or `{ id }` object) and fall back to reading the latest model entry and switch timestamp from local Claude Code or Codex transcripts (`transcript_path`) when omitted. Background discovery also resolves model IDs for previously ended Claude and Codex windows via `GET`/`POST /api/v1/windows/models`.
 - **Fail-open execution**: Missing credentials, unreachable local service, or malformed stdin exit with code `0` and empty output within 2.5 seconds. Every execution logs one line to `%USERPROFILE%\.acm\logs\hooks.log`.
 - **Mid-turn urgent delivery**: Active Codex threads receive urgent messages immediately after their next tool call via `PostToolUse`. Approve the fourth hook once under Codex **Settings > Hooks** after running `install-clients`.
 - **Single delivery per urgent wake**: Once an urgent message wakes a window, continues its turn, or passes to its client queue, later hooks skip repeating it while `check_in` retains its unread state until explicitly read.
@@ -499,7 +508,7 @@ Run the automated test suites:
 ctest --preset windows-dev      # C++23 control core (106 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
 npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, alerts, wake, remote, tidy (81 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, models and sender history, alerts, wake, remote, tidy (91 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```
@@ -510,7 +519,8 @@ src\core\        C++23 core library: identity, conversations, messages, task boa
 src\server\      acm-core Drogon HTTP server (operator API, SSE stream, static console hosting)
 src\mcp\         MCP gateways (server.mjs, stdio.mjs), CLI bridge (cli.mjs), client hooks (hook.mjs),
                  tool contract (tools.mjs), wake sender (wake.mjs), idle dispatcher (dispatch.mjs),
-                 system alerts (alerts.mjs), optional ngrok proxy (remote.mjs)
+                 window & model discovery (discover.mjs, record.mjs), system alerts (alerts.mjs),
+                 optional ngrok proxy (remote.mjs)
 ui\              Bilingual operator web console (React 19 + TypeScript + Vite)
 scripts\         install-clients.mjs, install-shortcut.mjs, build-icon.mjs, acm-admin.mjs,
                  demo.mjs, capture-screens.mjs, dev-env.ps1

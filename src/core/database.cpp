@@ -534,6 +534,26 @@ constexpr const char* kMigrations[] = {
         SELECT conversation_id, digest, digest_seq, COALESCE(digest_at, ''), digest_by
         FROM conversations WHERE digest IS NOT NULL;
     )sql",
+    // 029 - which model is at work: per window (its client's hooks say so, or the
+    // model itself when it checks in), per session as a fallback, and on every
+    // message as it was when the message was written.
+    R"sql(
+    ALTER TABLE windows ADD COLUMN model TEXT;
+    ALTER TABLE agent_sessions ADD COLUMN model TEXT;
+    ALTER TABLE messages ADD COLUMN author_model TEXT;
+    )sql",
+    // 030 - windows whose model became known under 029 get it on what they wrote before, as
+    // every window does from now on when its model is first known.
+    R"sql(
+    UPDATE messages SET author_model = (SELECT w.model FROM windows w WHERE w.window_id = messages.author_window_id)
+    WHERE author_model IS NULL AND author_window_id IS NOT NULL;
+    )sql",
+    // 031 - under 029 a window's report was also kept for its whole session; a session's own
+    // entry is only for what the application says in a call that no window is known for.
+    R"sql(
+    UPDATE agent_sessions SET model = NULL
+    WHERE EXISTS (SELECT 1 FROM windows w WHERE w.session_id = agent_sessions.session_id);
+    )sql",
 };
 
 }  // namespace

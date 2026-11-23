@@ -330,6 +330,10 @@ async function seed() {
   await activate('codex2', 'codex-desktop', 'C:\\Projects\\other-task');
   await pair('agy', 'agt_antigravity', COPY.lblAgy);
   await activate('agy', 'antigravity', projectRoot);
+  // Which model is at work, as each client would report it. One session reports none.
+  await tool(clients.claude, 'check_in', { model: 'claude-sonnet-4-6' });
+  await tool(clients.codex1, 'check_in', { model: 'gpt-5-codex' });
+  await tool(clients.agy, 'check_in', { model: 'gemini-3-pro' });
 
   // Seed one pending approval, one issued-but-unconnected pairing, and one revoked session.
   await admin('PUT', '/api/v1/settings', { open_mode: false });

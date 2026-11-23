@@ -252,6 +252,98 @@ json Windows::rename(const Session& session, const Window& window, const json& a
     });
 }
 
+json Windows::wanting_model() {
+    json windows = json::array();
+    Statement rows = database_.query(
+        "SELECT w.window_id, w.client, w.client_session FROM windows w WHERE w.model IS NULL AND "
+        "w.client_session IS NOT NULL AND w.client IN ('claude', 'codex') AND EXISTS (SELECT 1 FROM messages m "
+        "WHERE m.author_window_id = w.window_id AND m.author_model IS NULL) ORDER BY w.seen_at DESC LIMIT 200");
+    while (rows.step()) {
+        windows.push_back({{"window_id", rows.text(0)}, {"client", rows.text(1)}, {"client_session", rows.text(2)}});
+    }
+    return {{"windows", windows}};
+}
+
+json Windows::label_models(const json& args) {
+    if (!args.contains("models") || !args.at("models").is_array() || args.at("models").size() > 500) {
+        throw ControlError("INVALID_ARGUMENT", "models must be a list of at most 500 entries");
+    }
+    return database_.transaction([&] {
+        std::int64_t labelled = 0;
+        const Session nobody{};
+        for (const auto& entry : args.at("models")) {
+            Window window{};
+            window.window_id = require_string(entry, "window_id", 96);
+            Statement known = database_.query("SELECT model FROM windows WHERE window_id = ?", window.window_id);
+            // Gone, or its own hook was quicker: nothing to do.
+            if (!known.step() || known.optional_text(0)) {
+                continue;
+            }
+            note_model(nobody, &window, require_string(entry, "model", 250), optional_string(entry, "since", 40));
+            labelled += 1;
+        }
+        return json{{"labelled", labelled}};
+    });
+}
+
+std::optional<std::string> Windows::model_of(const Session& session, const Window* window) {
+    Statement known = window != nullptr
+        ? database_.query("SELECT model FROM windows WHERE window_id = ?", window->window_id)
+        : database_.query("SELECT model FROM agent_sessions WHERE session_id = ?", session.session_id);
+    return known.step() ? known.optional_text(0) : std::nullopt;
+}
+
+void Windows::note_model(const Session& session, const Window* window, const std::optional<std::string>& model,
+                         const std::optional<std::string>& since) {
+    if (!model || model->empty()) {
+        return;
+    }
+    // Printable and short: it is shown beside every message.
+    std::string name;
+    for (unsigned char c : *model) {
+        if (c >= 0x20 && c != 0x7F && name.size() < 80 && !(c == 0x20 && name.empty())) {
+            name.push_back(static_cast<char>(c));
+        }
+    }
+    while (!name.empty() && name.back() == ' ') {
+        name.pop_back();
+    }
+    if (name.empty()) {
+        return;
+    }
+    // A time as the clients and this service write it: 2026-01-02T03:04:05[.678]Z. Anything else bounds nothing.
+    std::string from;
+    if (since && since->size() >= 20 && since->size() <= 30 && since->back() == 'Z' && (*since)[4] == '-' &&
+        (*since)[10] == 'T' && since->find_first_not_of("0123456789-:.TZ") == std::string::npos) {
+        from = *since;
+    }
+    // Per window where there is one; the session's own entry is for clients without windows.
+    Statement known = window != nullptr
+        ? database_.query("SELECT model FROM windows WHERE window_id = ?", window->window_id)
+        : database_.query("SELECT model FROM agent_sessions WHERE session_id = ?", session.session_id);
+    const bool first = known.step() && !known.optional_text(0);
+    if (window != nullptr) {
+        database_.execute("UPDATE windows SET model = ? WHERE window_id = ?", name, window->window_id);
+    } else {
+        database_.execute("UPDATE agent_sessions SET model = ? WHERE session_id = ?", name, session.session_id);
+    }
+    if (!first) {
+        return;
+    }
+    // Known for the first time: a conversation keeps its model as a rule, so what it wrote
+    // before is taken to be this model's too, back to where the client saw it change.
+    if (window != nullptr) {
+        database_.execute("UPDATE messages SET author_model = ? WHERE author_window_id = ? AND author_model IS NULL "
+                          "AND created_at >= ?", name, window->window_id, from);
+    } else {
+        // Only for a client that has no windows at all: where there are windows, what was
+        // written without one came from several conversations, and one name does not fit them all.
+        database_.execute("UPDATE messages SET author_model = ? WHERE sender_session_id = ? AND author_window_id IS NULL "
+                          "AND author_model IS NULL AND created_at >= ? AND NOT EXISTS (SELECT 1 FROM windows w "
+                          "WHERE w.session_id = ?)", name, session.session_id, from, session.session_id);
+    }
+}
+
 json Windows::admin_rename(std::string_view window_id, const json& args) {
     const auto name = require_string(args, "name", 48);
     return database_.transaction([&] {
@@ -327,7 +419,7 @@ std::string Windows::client_of(std::string_view window_id) {
 json Windows::of_session(std::string_view session_id, const Window* self, std::int64_t limit) {
     json windows = json::array();
     Statement rows = database_.query(
-        "SELECT window_id, name, event, seen_at, watch_seen_at, cwd, imported, title FROM windows WHERE session_id = ?1 "
+        "SELECT window_id, name, event, seen_at, watch_seen_at, cwd, imported, title, model FROM windows WHERE session_id = ?1 "
         "AND seen_at > ?2 AND addressable = 1 ORDER BY (window_id = ?3) DESC, seen_at DESC LIMIT ?4",
         session_id, to_rfc3339(clock_() - std::chrono::seconds(kLiveSeconds)),
         self != nullptr ? self->window_id : std::string(), limit);
@@ -336,6 +428,8 @@ json Windows::of_session(std::string_view session_id, const Window* self, std::i
                            {"name", rows.text(1)},
                            // What its client shows as the title of the conversation, when known.
                            {"title", nullable(rows.optional_text(7))},
+                           // Which model is at work there, when it is known.
+                           {"model", nullable(rows.optional_text(8))},
                            {"state", state_of(rows.text(2), rows.text(3), rows.optional_text(4))},
                            {"last_active_at", rows.text(3)},
                            {"cwd", nullable(rows.optional_text(5))},

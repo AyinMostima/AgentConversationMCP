@@ -25,7 +25,7 @@ const urgent = z
 // removed or the parameters of one change, together with kToolContract in
 // src/core/control_service.hpp. A client keeps the bridge it started with, so
 // this is how the console recognises one that has to be restarted.
-export const TOOL_CONTRACT = 5;
+export const TOOL_CONTRACT = 6;
 
 const toWindows = z
   .array(z.string().min(1))
@@ -77,6 +77,7 @@ export const TOOLS = [
     input: {
       conversation_id: conversationId.optional().describe('Limit the check to one conversation'),
       limit: z.number().int().min(1).max(200).optional().describe('Most new messages per conversation, default 15. When more are unread you get the newest ones, the conversation\'s digest for what it covers, and skipped_earlier for the rest; read_messages has every message.'),
+      model: z.string().min(1).max(100).optional().describe('Exact runtime model identifier (for example claude-opus-4-6, gpt-5.2-codex, or gemini-3-pro) attached to messages from this window. Omit when unavailable; never guess.'),
       all_windows: z.boolean().optional().describe('List every window of each session instead of the most recently used ones (windows_not_listed says how many were left out).'),
     },
   },

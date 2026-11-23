@@ -388,6 +388,76 @@ await shot('flow-digest-panel', 'light', desktop, async (page) => {
   await page.getByRole('button', { name: 'Write digest' }).click();
   await page.getByPlaceholder(/Summarize decisions/).waitFor({ timeout: 3000 });
 });
+await shot('flow-open-at-newest', 'light', desktop, async (page) => {
+  // A timeline is at its newest message whenever it comes onto the page: a conversation
+  // opened, the board left, another tab left.
+  const atEnd = async (what) => {
+    await page.locator('.timeline .msg').first().waitFor({ timeout: 5000 });
+    await page.waitForTimeout(250);
+    const gap = await page.evaluate(() => {
+      const timeline = document.querySelector('.timeline');
+      return timeline.scrollHeight - timeline.clientHeight - timeline.scrollTop;
+    });
+    if (gap > 4) {
+      throw new Error(`${what}: the timeline is ${gap}px above its newest message`);
+    }
+  };
+  await atEnd('first conversation');
+  const tall = await page.evaluate(() => {
+    const timeline = document.querySelector('.timeline');
+    return timeline.scrollHeight > timeline.clientHeight + 40;
+  });
+  if (!tall) {
+    throw new Error('the demo timeline should be taller than the page for this check to mean anything');
+  }
+  // Read something older, then go away and come back.
+  await page.evaluate(() => { document.querySelector('.timeline').scrollTop = 0; });
+  await openConversation(page, 'Lobby');
+  await atEnd('lobby');
+  await page.evaluate(() => { document.querySelector('.timeline').scrollTop = 0; });
+  await toBoard(page);
+  await page.getByRole('tab', { name: /^Messages/ }).click();
+  await atEnd('back from the board');
+  await page.evaluate(() => { document.querySelector('.timeline').scrollTop = 0; });
+  await toAgents(page);
+  await page.getByRole('button', { name: 'Workspace', exact: true }).click();
+  await atEnd('back from another tab');
+});
+await shot('flow-sender-history', 'light', desktop, async (page) => {
+  // Each message names the model that wrote it; clicking the sender avatar opens sender history.
+  await page.locator('.msg .msg-model', { hasText: 'claude-sonnet-4-6' }).first().waitFor({ timeout: 5000 });
+  await page.locator('.msg', { has: page.locator('.msg-model', { hasText: 'claude-sonnet-4-6' }) }).first().locator('.msg-face').click();
+  await page.getByRole('heading', { name: /: messages$/ }).waitFor({ timeout: 3000 });
+  await page.locator('.history-item').first().waitFor({ timeout: 3000 });
+  const listed = await page.locator('.history-item').count();
+  const total = Number((await page.locator('.panel .muted.small').first().textContent()).match(/\d+/)[0]);
+  if (listed === 0 || total < listed) {
+    throw new Error(`history: ${listed} listed of ${total}`);
+  }
+  if ((await page.locator('.history-item .msg-model', { hasText: 'claude-sonnet-4-6' }).count()) === 0) {
+    throw new Error('the history should name the model of each message');
+  }
+  // Opening one in full, and going to where it was said.
+  await page.locator('.history-body').first().click();
+  await page.locator('.history-item.is-open .history-full').first().waitFor({ timeout: 3000 });
+  await page.getByRole('button', { name: 'Show less' }).click();
+  await page.locator('.history-body').first().click();
+  await page.locator('.history-place:not(:disabled)').first().click();
+  await page.locator('.timeline .msg').first().waitFor({ timeout: 3000 });
+  // The other panels take its place.
+  await page.getByRole('button', { name: /^Digest/ }).click();
+  await page.getByRole('heading', { name: 'Digest & Compaction' }).waitFor({ timeout: 3000 });
+  if ((await page.locator('.history-item').count()) !== 0) {
+    throw new Error('the digest panel should take the place of the history');
+  }
+  await page.locator('.msg .msg-face').first().click();
+  await page.getByRole('heading', { name: /: messages$/ }).waitFor({ timeout: 3000 });
+});
+await shot('flow-sender-history-zh-dark', 'dark', { width: 420, height: 860 }, async (page) => {
+  await page.locator('.msg .msg-face').first().click();
+  await page.getByRole('heading', { name: /的历史发言$/ }).waitFor({ timeout: 3000 });
+  await page.locator('.history-item').first().waitFor({ timeout: 3000 });
+}, 1, undefined, 'zh-CN');
 await shot('flow-identities', 'light', desktop, async (page) => {
   // Avatars and names: verify default avatars, toggle off to monograms, and restore.
   await toSettings(page);

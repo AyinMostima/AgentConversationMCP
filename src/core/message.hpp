@@ -99,6 +99,11 @@ public:
     // Operator: {conversation_id, body, kind?, recipient_session_ids?, idempotency_key?}.
     json send_as_operator(const json& args, std::vector<Window> to_windows = {});
 
+    // Operator: what one sender wrote, newest first, across conversations. `sender`
+    // is an agent id, or "operator" for what was written at the console.
+    // {limit?, before?} -> {messages (each with its conversation), has_more, next_before, total}.
+    json by_sender(std::string_view sender, const json& args);
+
     // Operator: every message with all recipient receipts; {after_seq?, limit?}.
     json read_all(std::string_view conversation_id, const json& args);
 

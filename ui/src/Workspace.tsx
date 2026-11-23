@@ -1,7 +1,7 @@
 // Workspace view: project/conversation sidebar, message timeline, task board
 // toggle, operator composer, and member permissions inspector.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Compaction, Conversation, DigestEntry, Member, Message, Session } from './api';
+import type { Compaction, Conversation, DigestEntry, Member, Message, SenderHistory, Session } from './api';
 import { Dialog, useConsole } from './App';
 import { BoardView, GoalLine, useTasks } from './Board';
 import { GrokPrefillButton } from './Grok';
@@ -367,7 +367,85 @@ function DigestHistory({ conversation, stamp }: { conversation: Conversation; st
   );
 }
 
-function MessageItem({ message, members, parent }: { message: Message; members: Map<string, Member>; parent: Message | undefined }) {
+/** Whose words to list: an application (by its agent) or the operator. */
+interface Sender {
+  key: string;
+  name: string;
+  provider: string | null;
+}
+
+/** Everything one sender wrote, newest first, across conversations. Opened from its face in a timeline. */
+function HistoryPanel({ sender, onOpen, onClose }: { sender: Sender; onOpen: (conversationId: string) => void; onClose: () => void }) {
+  const { api, data, notify } = useConsole();
+  const { t } = useI18n();
+  const [history, setHistory] = useState<SenderHistory | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [busy, track] = useBusy();
+  useEffect(() => {
+    let cancelled = false;
+    setHistory(null);
+    api.senderMessages(sender.key, null)
+      .then((page) => !cancelled && setHistory(page))
+      .catch((failure: Error) => notify('danger', failure.message));
+    return () => {
+      cancelled = true;
+    };
+  }, [api, notify, sender.key]);
+  const more = () =>
+    history !== null && history.next_before !== null
+      ? track(api.senderMessages(sender.key, history.next_before).then((page) => setHistory({ ...page, messages: [...history.messages, ...page.messages] })))
+      : undefined;
+  const place = (entry: SenderHistory['messages'][number]) => {
+    const known = data.conversations.find((conversation) => conversation.conversation_id === entry.conversation_id);
+    return known !== undefined ? conversationName(known, t) : entry.conversation.kind === 'lobby' ? t.conversation.lobby : entry.conversation.title;
+  };
+  return (
+    <aside className="panel sheet" aria-label={t.workspace.historyTitle(sender.name)}>
+      <header className="panel-head">
+        <h2 className="history-head">
+          <ProviderMark provider={sender.provider} size="sm" /> {t.workspace.historyTitle(sender.name)}
+        </h2>
+        <button type="button" className="btn btn-quiet btn-icon" aria-label={t.common.close} onClick={onClose}>
+          <Icon name="close" />
+        </button>
+      </header>
+      <section className="panel-section">
+        {history === null && <p className="muted">{t.workspace.loadingMessages}</p>}
+        {history !== null && <p className="muted small">{t.workspace.historyCount(history.total)}</p>}
+        {history !== null && history.messages.length === 0 && <p className="muted">{t.workspace.historyNone}</p>}
+        <ul className="history-list">
+          {(history?.messages ?? []).map((entry) => (
+            <li key={entry.message_id} className={`history-item ${open === entry.message_id ? 'is-open' : ''}`}>
+              <div className="history-meta">
+                <button type="button" className="history-place" title={t.workspace.historyOpen} disabled={entry.conversation.status !== 'open'} onClick={() => onOpen(entry.conversation_id)}>
+                  {place(entry)}
+                </button>
+                {entry.from_window !== null && <span className="muted small">{entry.from_window.name}</span>}
+                {entry.sender.model !== null && <span className="msg-model" title={t.workspace.modelTitle}>{entry.sender.model}</span>}
+                <span className="detail-time" title={formatFullTime(entry.created_at, t.dateLocale)}>{formatTime(entry.created_at, t.dateLocale)}</span>
+              </div>
+              {open === entry.message_id ? (
+                <>
+                  <div className="history-full"><Markdown text={entry.body} /></div>
+                  <button type="button" className="history-less" aria-expanded onClick={() => setOpen(null)}>{t.workspace.historyLess}</button>
+                </>
+              ) : (
+                <button type="button" className="history-body" aria-expanded={false} onClick={() => setOpen(entry.message_id)}>
+                  {entry.body}
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+        {history !== null && history.has_more && (
+          <ActionButton className="btn btn-quiet" disabled={busy} onAction={() => more()}>{t.workspace.historyMore}</ActionButton>
+        )}
+      </section>
+    </aside>
+  );
+}
+
+function MessageItem({ message, members, parent, onSender }: { message: Message; members: Map<string, Member>; parent: Message | undefined; onSender: (sender: Sender) => void }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const nameOf = (sessionId: string) => {
@@ -378,11 +456,24 @@ function MessageItem({ message, members, parent }: { message: Message; members: 
   const forwarded = message.payload?.forwarded as Record<string, unknown> | undefined;
   return (
     <article className="msg" id={message.message_id}>
-      <ProviderMark provider={message.sender.kind === 'operator' ? null : message.sender.provider} />
+      {message.sender.kind === 'operator' || message.sender.agent_id !== null ? (
+        <button
+          type="button"
+          className="msg-face"
+          title={t.workspace.historyOf(senderName(message, t))}
+          aria-label={t.workspace.historyOf(senderName(message, t))}
+          onClick={() => onSender({ key: message.sender.kind === 'operator' ? 'operator' : message.sender.agent_id!, name: senderName(message, t), provider: message.sender.kind === 'operator' ? null : message.sender.provider })}
+        >
+          <ProviderMark provider={message.sender.kind === 'operator' ? null : message.sender.provider} />
+        </button>
+      ) : (
+        <ProviderMark provider={message.sender.provider} />
+      )}
       <div className="msg-main">
         <header className="msg-head">
           <span className="msg-author">{senderName(message, t)}</span>
           {message.sender.label !== null && <span className="msg-label">{message.sender.label}{message.from_window !== null && ` · ${message.from_window.name}`}</span>}
+          {message.sender.model !== null && message.sender.model !== undefined && <span className="msg-model" title={t.workspace.modelTitle}>{message.sender.model}</span>}
           {message.context !== null && (
             <span className="tag" title={t.workspace.contextTitle[message.context]}>{t.workspace.contextLabel[message.context]}</span>
           )}
@@ -781,13 +872,27 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
   const [panelOpen, setPanelOpen] = useState(false);
   // The digest panel takes the same place as the members panel; one of them at a time.
   const [digestOpen, setDigestOpen] = useState(false);
+  // Whose history is open, in that same place.
+  const [historyOf, setHistoryOf] = useState<Sender | null>(null);
   const [dialog, setDialog] = useState<'project' | 'conversation' | null>(null);
   const [listFilter, setListFilter] = useState<ListFilter>(NO_FILTER);
   const [tidying, setTidying] = useState(false);
   const [picked, setPicked] = useState<string[]>([]);
   const [unseen, setUnseen] = useState(0);
-  const scroller = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement | null>(null);
   const atBottom = useRef(true);
+  // The timeline as it is on the page now: it is mounted anew when a conversation
+  // is opened, when the view comes back from the board, and when this tab is shown again.
+  const [timeline, setTimeline] = useState<HTMLDivElement | null>(null);
+  const attachTimeline = useCallback((element: HTMLDivElement | null) => {
+    scroller.current = element;
+    if (element !== null) {
+      // Opened: at the newest message.
+      atBottom.current = true;
+      element.scrollTop = element.scrollHeight;
+    }
+    setTimeline(element);
+  }, []);
   const seenCount = useRef(0);
 
   const filters: { id: Filter; label: string }[] = useMemo(
@@ -824,7 +929,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
     atBottom.current = true;
     seenCount.current = 0;
     setUnseen(0);
-  }, [conversation?.conversation_id]);
+  }, [conversation?.conversation_id, filter]);
 
   useEffect(() => {
     const element = scroller.current;
@@ -839,6 +944,26 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
       setUnseen(Math.max(0, messages.length - seenCount.current));
     }
   }, [messages]);
+
+  // While the reader is at the end, the timeline stays there whatever grows above it
+  // afterwards: messages that are still being laid out, pictures, a filter that changes.
+  useEffect(() => {
+    if (timeline === null || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const keep = () => {
+      if (atBottom.current) {
+        timeline.scrollTop = timeline.scrollHeight;
+      }
+    };
+    const observer = new ResizeObserver(keep);
+    observer.observe(timeline);
+    if (timeline.firstElementChild !== null) {
+      observer.observe(timeline.firstElementChild);
+    }
+    keep();
+    return () => observer.disconnect();
+  }, [timeline]);
 
   const jumpToEnd = () => {
     const element = scroller.current;
@@ -861,7 +986,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
   }
 
   return (
-    <div className={`workspace ${panelOpen || digestOpen ? 'has-panel' : ''}`}>
+    <div className={`workspace ${panelOpen || digestOpen || historyOf !== null ? 'has-panel' : ''}`}>
       <nav className="sidebar" aria-label={t.workspace.sidebarAria}>
         <div className="sidebar-actions">
           <details className="menu">
@@ -996,6 +1121,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
                 title={t.workspace.digestBtnTitle}
                 onClick={() => {
                   setPanelOpen(false);
+                  setHistoryOf(null);
                   setDigestOpen((open) => !open);
                 }}
               >
@@ -1007,6 +1133,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
                 aria-pressed={panelOpen}
                 onClick={() => {
                   setDigestOpen(false);
+                  setHistoryOf(null);
                   setPanelOpen((open) => !open);
                 }}
               >
@@ -1033,7 +1160,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
             <>
               <div
                 className="timeline"
-                ref={scroller}
+                ref={attachTimeline}
                 onScroll={(event) => {
                   const element = event.currentTarget;
                   atBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
@@ -1058,7 +1185,17 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
                   )}
                   {messages.length > 0 && visible.length === 0 && <p className="muted center">{t.workspace.emptyFilterMessages}</p>}
                   {visible.map((message) => (
-                    <MessageItem key={message.message_id} message={message} members={members} parent={message.reply_to_message_id === null ? undefined : byId.get(message.reply_to_message_id)} />
+                    <MessageItem
+                      key={message.message_id}
+                      message={message}
+                      members={members}
+                      parent={message.reply_to_message_id === null ? undefined : byId.get(message.reply_to_message_id)}
+                      onSender={(sender) => {
+                        setPanelOpen(false);
+                        setDigestOpen(false);
+                        setHistoryOf(sender);
+                      }}
+                    />
                   ))}
                 </div>
               </div>
@@ -1075,6 +1212,7 @@ export function WorkspaceView({ onOpenAgents }: { onOpenAgents: () => void }) {
 
       {conversation !== undefined && panelOpen && <MembersPanel conversation={conversation} onOpenAgents={onOpenAgents} onClose={() => setPanelOpen(false)} />}
       {conversation !== undefined && digestOpen && !panelOpen && <DigestPanel key={conversation.conversation_id} conversation={conversation} onClose={() => setDigestOpen(false)} />}
+      {historyOf !== null && !panelOpen && !digestOpen && <HistoryPanel key={historyOf.key} sender={historyOf} onOpen={setSelectedId} onClose={() => setHistoryOf(null)} />}
       {dialog === 'project' && <NewProjectDialog onClose={() => setDialog(null)} />}
       {dialog === 'conversation' && <NewConversationDialog projectId={conversation?.project_id ?? data.projects[0].project_id} onClose={() => setDialog(null)} onCreated={setSelectedId} />}
     </div>

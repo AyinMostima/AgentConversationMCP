@@ -238,6 +238,118 @@ const COMPONENT_TONE: Record<string, string> = {
   failed: 'danger',
 };
 
+/** The account the console is signed in to with a name and a password. */
+function Account() {
+  const { api, data, run, notify, adoptLogin } = useConsole();
+  const { t } = useI18n();
+  const account = data.account;
+  const [open, setOpen] = useState(false);
+  const [username, setUsername] = useState(account?.username ?? '');
+  const [password, setPassword] = useState('');
+  const [repeat, setRepeat] = useState('');
+  const [current, setCurrent] = useState('');
+  const [busy, track] = useBusy();
+  // Signed in with the account, the current password is asked for; the installation's
+  // credential may set a new one without it (a forgotten password).
+  const needsCurrent = account !== null && data.authority === 'login';
+  const mismatch = repeat !== '' && repeat !== password;
+  const ready = username.trim() !== '' && password !== '' && repeat === password && (!needsCurrent || current !== '');
+  return (
+    <section className="setting setting-stack">
+      <div className="setting-row">
+        <Icon name="lock" size={18} />
+        <div>
+          <strong>{t.settings.accountTitle}</strong>
+          <p className="wrap">{account === null ? t.settings.accountNone : t.settings.accountSummary(account.username)}</p>
+        </div>
+        <MoreButton open={open} onToggle={() => setOpen((value) => !value)} label={t.settings.accountAria} />
+      </div>
+      {open && (
+        <form
+          className="hook-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!ready) {
+              return;
+            }
+            void track(
+              api
+                .setAccount({ username: username.trim(), password, ...(needsCurrent ? { current_password: current } : {}) })
+                .then((login) => {
+                  // The logins from before are over; this page goes on with the new one.
+                  setPassword('');
+                  setRepeat('');
+                  setCurrent('');
+                  notify('ok', t.settings.accountSaved);
+                  adoptLogin(login.token);
+                })
+                .catch((failure: Error & { details?: Record<string, unknown>; code?: string }) =>
+                  notify(
+                    'danger',
+                    failure.code === 'LOGIN_FAILED'
+                      ? t.settings.accountWrongCurrent
+                      : failure.details?.reason === 'password_short'
+                        ? t.signIn.passwordShort(Number(failure.details.minimum ?? 8))
+                        : failure.message,
+                  ),
+                ),
+            );
+          }}
+        >
+          <p className="muted small">{t.settings.accountHint}</p>
+          <label className="field">
+            <span>{t.signIn.usernameLabel}</span>
+            <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" spellCheck={false} autoCapitalize="none" />
+          </label>
+          {needsCurrent && (
+            <label className="field">
+              <span>{t.settings.accountCurrent}</span>
+              <input type="password" value={current} onChange={(event) => setCurrent(event.target.value)} autoComplete="current-password" />
+            </label>
+          )}
+          <label className="field">
+            <span>{account === null ? t.signIn.passwordLabel : t.settings.accountNewPassword}</span>
+            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" />
+            <small>{t.signIn.passwordHint}</small>
+          </label>
+          <label className="field">
+            <span>{t.signIn.repeatLabel}</span>
+            <input type="password" value={repeat} onChange={(event) => setRepeat(event.target.value)} autoComplete="new-password" aria-invalid={mismatch} />
+            {mismatch && <small className="field-problem" role="alert">{t.signIn.repeatMismatch}</small>}
+          </label>
+          <div className="row-actions">
+            {account !== null && (
+              <ActionButton className="btn btn-quiet" onAction={() => run(() => api.signOut(true), t.settings.accountSignedOutAll)}>
+                {t.settings.accountSignOutAll}
+              </ActionButton>
+            )}
+            <SubmitButton busy={busy} disabled={!ready}>{t.common.save}</SubmitButton>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Why a pasted text cannot be an ngrok authtoken, or null. The same rules as the service's:
+ * the dashboard's list of authtokens shows and copies the id of a credential (cr_...), which
+ * is what gets pasted most often in place of the token.
+ */
+function tokenProblem(value: string, t: Messages): string | null {
+  if (value === '') {
+    return null;
+  }
+  if (!/^[A-Za-z0-9_]+$/.test(value)) {
+    return t.settings.tokenBadCharacters;
+  }
+  const id = /^([a-z]{2,8})_[A-Za-z0-9]{27}$/.exec(value);
+  if (id === null) {
+    return null;
+  }
+  return id[1] === 'cr' ? t.settings.tokenIsCredentialId : id[1] === 'ak' ? t.settings.tokenIsApiKeyId : t.settings.tokenIsResourceId;
+}
+
 /** Optional remote access to the console via an on-demand ngrok component. */
 function RemoteAccess() {
   const { api, data, run } = useConsole();
@@ -249,12 +361,19 @@ function RemoteAccess() {
   const [busy, track] = useBusy();
   const installed = remote.component === 'installed';
   const ready = installed && remote.has_authtoken;
+  const problem = tokenProblem(authtoken.trim(), t);
+  // ngrok's own answer to a token of the wrong shape does not say what to do about it.
+  const malformed = remote.state === 'error' && (remote.detail ?? '').includes('ERR_NGROK_105');
   const summary = remote.enabled
     ? remote.state === 'online'
-      ? t.settings.remoteOnline
-      : remote.state === 'error'
-        ? t.settings.remoteError(remote.detail ?? t.common.unknown)
-        : t.settings.remoteConnecting
+      ? remote.domain_fallback
+        ? t.settings.remoteOnlineFallback(remote.default_domain, remote.detail ?? t.common.unknown)
+        : t.settings.remoteOnline
+      : malformed
+        ? t.settings.remoteTokenMalformed
+        : remote.state === 'error'
+          ? t.settings.remoteError(remote.detail ?? t.common.unknown)
+          : t.settings.remoteConnecting
     : !installed
       ? t.settings.remoteMissing
       : !remote.has_authtoken
@@ -287,6 +406,9 @@ function RemoteAccess() {
           className="hook-form"
           onSubmit={(event) => {
             event.preventDefault();
+            if (problem !== null) {
+              return;
+            }
             void track(run(() => api.setRemoteAccess({ authtoken: authtoken.trim() === '' ? undefined : authtoken.trim(), domain: domain.trim() }), t.settings.remoteSaved)).then((saved) => saved !== undefined && setAuthtoken(''));
           }}
         >
@@ -303,15 +425,16 @@ function RemoteAccess() {
           {!installed && <p className="muted small">{t.settings.installHint(remote.component_detail)}</p>}
           <label className="field">
             <span>{t.settings.tokenLabel}</span>
-            <input type="password" value={authtoken} onChange={(event) => setAuthtoken(event.target.value)} placeholder={remote.has_authtoken ? t.settings.tokenPlaceholderSaved : t.settings.tokenPlaceholderNew} spellCheck={false} autoComplete="off" />
-            <small>{t.settings.tokenHint}</small>
+            <input type="password" value={authtoken} onChange={(event) => setAuthtoken(event.target.value)} placeholder={remote.has_authtoken ? t.settings.tokenPlaceholderSaved : t.settings.tokenPlaceholderNew} spellCheck={false} autoComplete="off" aria-invalid={problem !== null} />
+            {problem !== null ? <small className="field-problem" role="alert">{problem}</small> : <small>{t.settings.tokenHint}</small>}
           </label>
           <label className="field">
             <span>{t.settings.domainLabel}</span>
-            <input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder={t.settings.domainPlaceholder} spellCheck={false} autoComplete="off" />
+            <input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder={t.settings.domainPlaceholder(remote.default_domain)} spellCheck={false} autoComplete="off" />
+            <small>{t.settings.domainHint}</small>
           </label>
           <div className="row-actions">
-            <SubmitButton busy={busy} disabled={authtoken.trim() === '' && !remote.has_authtoken}>{t.common.save}</SubmitButton>
+            <SubmitButton busy={busy} disabled={problem !== null || (authtoken.trim() === '' && !remote.has_authtoken)}>{t.common.save}</SubmitButton>
           </div>
         </form>
       )}
@@ -571,6 +694,7 @@ export function SettingsView() {
         </header>
         <div className="settings-list">
           <LanguageSetting />
+          <Account />
           <Identities />
           <SharedRules />
           <Routes />

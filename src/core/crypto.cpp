@@ -70,6 +70,28 @@ std::string random_hex(std::size_t byte_count) {
     return to_hex(bytes.data(), bytes.size());
 }
 
+std::string pbkdf2_sha256_hex(std::string_view password, std::string_view salt, std::uint32_t iterations) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    check(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG),
+          "open HMAC-SHA-256");
+    std::vector<unsigned char> key(32);
+    const NTSTATUS status = BCryptDeriveKeyPBKDF2(
+        algorithm, reinterpret_cast<PUCHAR>(const_cast<char*>(password.data())), static_cast<ULONG>(password.size()),
+        reinterpret_cast<PUCHAR>(const_cast<char*>(salt.data())), static_cast<ULONG>(salt.size()), iterations, key.data(),
+        static_cast<ULONG>(key.size()), 0);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    check(status, "derive a key from a password");
+    return to_hex(key.data(), key.size());
+}
+
+bool constant_time_equal(std::string_view left, std::string_view right) {
+    unsigned char difference = left.size() == right.size() ? 0 : 1;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        difference |= static_cast<unsigned char>(left[index] ^ (index < right.size() ? right[index] : 0));
+    }
+    return difference == 0;
+}
+
 std::string sha256_hex(std::string_view data) {
     Sha256 hash;
     hash.update(data.data(), data.size());

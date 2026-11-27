@@ -64,6 +64,24 @@ export async function startConsoleProxy({ coreUrl, adminToken, onRestart }) {
     failures.set(caller, entry);
   };
 
+  // The installation's credential, or a login of the operator's account (which the control service knows).
+  const allowed = async (presented) => {
+    if (typeof presented !== 'string' || presented === '') {
+      return false;
+    }
+    if (presented === adminToken()) {
+      return true;
+    }
+    if (!presented.startsWith('acmlogin_')) {
+      return false;
+    }
+    try {
+      return (await fetch(`${coreUrl}/api/v1/session`, { headers: { 'x-acm-admin-token': presented } })).ok;
+    } catch {
+      return false;
+    }
+  };
+
   const server = createServer((request, response) => {
     const path = new URL(request.url ?? '/', coreUrl).pathname;
     const caller = callerOf(request);
@@ -76,18 +94,22 @@ export async function startConsoleProxy({ coreUrl, adminToken, onRestart }) {
       return;
     }
     if (path === '/_gateway/restart') {
-      if (request.method !== 'POST' || request.headers['x-acm-admin-token'] !== adminToken()) {
-        countFailure(caller);
-        deny(response, 401, 'ADMIN_REQUIRED', 'operator credential required');
-        return;
-      }
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ ok: true, result: { restarting: true } }));
-      onRestart();
+      void allowed(request.headers['x-acm-admin-token']).then((yes) => {
+        if (request.method !== 'POST' || !yes) {
+          countFailure(caller);
+          deny(response, 401, 'ADMIN_REQUIRED', 'sign in first');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ ok: true, result: { restarting: true } }));
+        onRestart();
+      });
       return;
     }
+    // Marked as coming from outside: the control service makes the first account, and
+    // counts failed sign-ins, differently for those. A caller cannot take the mark off.
     const upstream = httpRequest(
-      { host: core.hostname, port: core.port, method: request.method, path: request.url, headers: { ...request.headers, host: core.host } },
+      { host: core.hostname, port: core.port, method: request.method, path: request.url, headers: { ...request.headers, host: core.host, 'x-acm-remote': '1' } },
       (answer) => {
         if (answer.statusCode === 401) {
           countFailure(caller);
@@ -246,9 +268,21 @@ export function startRemoteAccess({ coreUrl, adminToken, component, onRestart, i
           throw new Error('the ngrok component is not installed');
         }
         proxy = await startConsoleProxy({ coreUrl, adminToken, onRestart });
-        tunnel = await component.openTunnel({ port: proxy.address().port, authtoken: config.authtoken, domain: config.domain });
-        await report({ state: 'online', public_url: tunnel.url });
-        say(`remote access is on at ${tunnel.url}`);
+        // With no domain given, a name of this installation's own (agora-....ngrok.app). An ngrok
+        // account that may not choose a name gets the address ngrok assigns it, and is told why.
+        const own = config.domain === '' ? String(config.default_domain ?? '') : '';
+        let refusal;
+        try {
+          tunnel = await component.openTunnel({ port: proxy.address().port, authtoken: config.authtoken, domain: config.domain === '' ? own : config.domain });
+        } catch (error) {
+          if (own === '') {
+            throw error;
+          }
+          refusal = String(error.message ?? error).replaceAll(config.authtoken, '<authtoken>').slice(0, 300);
+          tunnel = await component.openTunnel({ port: proxy.address().port, authtoken: config.authtoken, domain: '' });
+        }
+        await report({ state: 'online', public_url: tunnel.url, domain_fallback: refusal !== undefined, detail: refusal });
+        say(refusal === undefined ? `remote access is on at ${tunnel.url}` : `remote access is on at ${tunnel.url} (the name ${own} was refused: ${refusal})`);
       } catch (error) {
         await closeAll();
         // Try again in a minute: the usual reasons are no network or a mistyped token.

@@ -107,7 +107,7 @@ std::string load_or_create_admin_token(const std::filesystem::path& data_dir) {
 }
 
 int http_status(const std::string& code) {
-    if (code == "UNAUTHENTICATED" || code == "SESSION_REVOKED" || code == "ADMIN_REQUIRED") {
+    if (code == "UNAUTHENTICATED" || code == "SESSION_REVOKED" || code == "ADMIN_REQUIRED" || code == "LOGIN_FAILED") {
         return 401;
     }
     if (code == "NOT_PAIRED" || code == "PAIRING_EXPIRED" || code == "NOT_MEMBER" || code == "READ_DENIED" ||
@@ -369,10 +369,38 @@ private:
         return response;
     }
 
-    void require_admin(const drogon::HttpRequestPtr& request) {
-        if (request->getHeader("x-acm-admin-token") != admin_token_) {
-            acm::fail("ADMIN_REQUIRED", "this endpoint needs the operator credential in X-ACM-Admin-Token");
+    // How the caller is known: "credential" (the installation's own credential), "login"
+    // (signed in with the operator's account) or "none". Both are presented in the same header.
+    std::string authority_of(const drogon::HttpRequestPtr& request) {
+        const std::string& presented = request->getHeader("x-acm-admin-token");
+        if (presented.empty()) {
+            return "none";
         }
+        if (acm::constant_time_equal(presented, admin_token_)) {
+            return "credential";
+        }
+        return service_.operator_check(presented) ? "login" : "none";
+    }
+
+    void require_admin(const drogon::HttpRequestPtr& request) {
+        if (authority_of(request) == "none") {
+            acm::fail("ADMIN_REQUIRED", "sign in first: this endpoint needs the operator's login or credential in X-ACM-Admin-Token");
+        }
+    }
+
+    // The proxy that the tunnel points at marks what it forwards. This service listens on
+    // this machine only, so anything without the mark was sent from this machine.
+    // Nor is a request that names another host than this machine's own: a page of some
+    // other site whose name was made to point here (DNS rebinding) is not this console.
+    static bool is_remote(const drogon::HttpRequestPtr& request) {
+        if (!request->getHeader("x-acm-remote").empty()) {
+            return true;
+        }
+        std::string host = request->getHeader("host");
+        if (const auto port = host.rfind(':'); port != std::string::npos && host.find(']', port) == std::string::npos) {
+            host.resize(port);
+        }
+        return !(host == "127.0.0.1" || host == "localhost" || host == "[::1]");
     }
 
     drogon::HttpResponsePtr route(const drogon::HttpRequestPtr& request) {
@@ -417,13 +445,35 @@ private:
         if (!(path.size() >= 3 && is(0, "api") && is(1, "v1"))) {
             acm::fail("NOT_FOUND", "no such endpoint");
         }
+        // Signing in: what the sign-in page asks before anybody is known.
+        if (path.size() == 3 && is(2, "login") && method == drogon::Get) {
+            return ok(service_.operator_status(is_remote(request)));
+        }
+        if (path.size() == 3 && is(2, "login") && method == drogon::Post) {
+            return ok(service_.operator_login(parse_body(request), is_remote(request)));
+        }
+        // Making the account (the first one, on this machine, needs no sign-in) or changing it.
+        if (path.size() == 3 && is(2, "account") && method == drogon::Put) {
+            return ok(service_.operator_account(parse_body(request), authority_of(request), is_remote(request)));
+        }
         require_admin(request);
+        if (path.size() == 3 && is(2, "session") && method == drogon::Get) {
+            const std::string authority = authority_of(request);
+            return ok({{"authority", authority}, {"account", service_.operator_view()}});
+        }
+        if (path.size() == 3 && is(2, "logout") && method == drogon::Post) {
+            const json body = parse_body(request);
+            service_.operator_logout(request->getHeader("x-acm-admin-token"), body.is_object() && body.value("all", false));
+            return ok({{"signed_out", true}});
+        }
 
         const std::string& resource = path[2];
         if (path.size() == 3) {
             if (resource == "bootstrap" && method == drogon::Get) {
                 json state = service_.admin("bootstrap", "", json::object());
                 state["service"] = service_info_;
+                state["account"] = service_.operator_view();
+                state["authority"] = authority_of(request);
                 state["service"]["version"] = kVersion;
                 return ok(state);
             }

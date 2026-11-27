@@ -53,7 +53,9 @@ export async function startService({ dataDir, mcpPort, corePort }) {
   const mcpBase = `http://127.0.0.1:${mcpPort}`;
   const coreUrl = `http://127.0.0.1:${corePort}`;
   let healthy = false;
-  for (let attempt = 0; attempt < 150 && !healthy && child.exitCode === null; attempt += 1) {
+  // Up to 45 seconds: on a machine that is busy with other work (or scanning a binary that
+  // was linked a moment ago) the control service can take that long to answer.
+  for (let attempt = 0; attempt < 450 && !healthy && child.exitCode === null; attempt += 1) {
     try {
       healthy = (await fetch(`${mcpBase}/healthz`)).ok;
     } catch {

@@ -25,6 +25,7 @@ add_library(acm_core STATIC
     src/core/wake.cpp
     src/core/delivery.cpp
     src/core/window.cpp
+    src/core/operator.cpp
 )
 target_include_directories(acm_core PUBLIC src)
 target_link_libraries(acm_core PUBLIC unofficial::sqlite3::sqlite3 nlohmann_json::nlohmann_json PRIVATE bcrypt)

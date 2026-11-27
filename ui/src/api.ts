@@ -318,6 +318,10 @@ export interface ClientHook {
 export interface RemoteAccess {
   enabled: boolean;
   has_authtoken: boolean;
+  /** The name the tunnel asks for when no domain is given: this installation's own. */
+  default_domain: string;
+  /** Online at the address ngrok assigned, because the account may not use the name asked for. */
+  domain_fallback: boolean;
   domain: string | null;
   state: 'stopped' | 'starting' | 'online' | 'error';
   public_url: string | null;
@@ -353,6 +357,10 @@ export interface Bootstrap {
   /** Clients that have used up their quota: nothing is started for them until `until`. */
   client_limits?: Record<string, { until: string; detail: string; noted_at: string }>;
   remote_access: RemoteAccess;
+  /** The operator's account for signing in, when one was made. */
+  account: { username: string } | null;
+  /** How this page is signed in: with the account, or with the installation's credential. */
+  authority: 'login' | 'credential';
   /** How many tools a current bridge offers. */
   tool_count: number;
   /** Version of the tool contract a current bridge offers. */
@@ -386,8 +394,45 @@ export class ApiError extends Error {
   }
 }
 
+/** What the sign-in page needs before anybody is known. */
+export interface LoginStatus {
+  /** Whether the operator made an account. */
+  account: boolean;
+  /** Whether one can be made here without signing in: only the first, only on the machine itself. */
+  setup_allowed: boolean;
+}
+
+/** A login of the operator's account: presented like the credential, good for 30 days after its last use. */
+export interface Login {
+  token: string;
+  expires_at: string;
+  username: string;
+}
+
+async function plainCall<T>(method: string, path: string, body?: unknown, token?: string): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    headers: { 'content-type': 'application/json', ...(token === undefined ? {} : { 'x-acm-admin-token': token }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const envelope = await response.json();
+  if (!envelope.ok) {
+    throw new ApiError(envelope.error.code, envelope.error.message, response.status, envelope.error.details ?? {});
+  }
+  return envelope.result as T;
+}
+
+export const loginStatus = (): Promise<LoginStatus> => plainCall('GET', '/api/v1/login');
+export const signInWithAccount = (username: string, password: string): Promise<Login> => plainCall('POST', '/api/v1/login', { username, password });
+/** Makes the first account. Works without signing in only on the machine the service runs on. */
+export const createAccount = (username: string, password: string): Promise<Login> => plainCall('PUT', '/api/v1/account', { username, password });
+
 export interface Api {
   bootstrap(): Promise<Bootstrap>;
+  /** Changes the account. Signed in with the account, the current password is needed. */
+  setAccount(body: { username?: string; password: string; current_password?: string }): Promise<Login>;
+  /** Ends this login, or every login of the account. */
+  signOut(all?: boolean): Promise<unknown>;
   createProject(body: { name: string; root_path?: string }): Promise<Project>;
   createAgent(body: { agent_id?: string; provider: string; client_kind: string; display_name: string }): Promise<Agent>;
   createPairing(body: { agent_id: string; project_id: string; label: string }): Promise<Session>;
@@ -461,6 +506,8 @@ export function createApi(token: string): Api {
   }
   return {
     bootstrap: () => request('GET', '/api/v1/bootstrap'),
+    setAccount: (body) => request('PUT', '/api/v1/account', body),
+    signOut: (all = false) => request('POST', '/api/v1/logout', { all }),
     createProject: (body) => request('POST', '/api/v1/projects', body),
     createAgent: (body) => request('POST', '/api/v1/agents', body),
     createPairing: (body) => request('POST', '/api/v1/pairings', body),

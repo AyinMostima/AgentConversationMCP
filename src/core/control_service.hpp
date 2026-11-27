@@ -15,6 +15,7 @@
 #include "message.hpp"
 #include "progress.hpp"
 #include "wake.hpp"
+#include "operator.hpp"
 #include "window.hpp"
 
 #include <filesystem>
@@ -45,6 +46,15 @@ public:
 
     // Operator entry. `target_id` carries the path id for operations on one entity.
     json admin(std::string_view operation, std::string_view target_id, const json& args);
+
+    // Signing in to the console with the operator's account. See OperatorAccount.
+    // `remote` is true for a request that came in through the tunnel.
+    json operator_status(bool remote);
+    json operator_login(const json& args, bool remote);
+    json operator_account(const json& args, std::string_view authority, bool remote);
+    std::optional<std::string> operator_check(std::string_view token);
+    void operator_logout(std::string_view token, bool all);
+    json operator_view();
 
     // Committed events with event_id > after, plus the current watermark.
     json events_after(std::int64_t after, std::int64_t limit);
@@ -82,6 +92,7 @@ private:
     // Remote access to the console through a tunnel: the operator's settings and
     // the state the gateway last reported. Never contains the tunnel credential.
     json remote_view();
+    std::string remote_default_domain();
 
     std::mutex mutex_;
     Database database_;
@@ -95,6 +106,7 @@ private:
     WakeHooks wake_;
     Delivery delivery_;
     Windows windows_;
+    OperatorAccount operator_;
     Clock clock_;
 };
 

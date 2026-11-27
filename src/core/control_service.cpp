@@ -1,5 +1,6 @@
 #include "control_service.hpp"
 
+#include "crypto.hpp"
 #include "settings.hpp"
 
 #include <array>
@@ -21,6 +22,7 @@ ControlService::ControlService(const std::filesystem::path& data_dir, Clock cloc
       wake_(database_, events_, clock),
       delivery_(database_, events_, clock),
       windows_(database_, events_, clock),
+      operator_(database_, events_, clock),
       clock_(clock) {
     identity_.expire_stale_pairings();
     // Whatever tunnel a previous run had is gone with that run.
@@ -396,6 +398,44 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             fail("INVALID_ARGUMENT", "enabled must be true or false");
         }
         const auto authtoken = optional_string(args, "authtoken", 256);
+        if (authtoken) {
+            // Refused here rather than a minute later by ngrok, whose answer does not say what
+            // was pasted. A token holds letters, digits and "_" only.
+            const std::string& token = *authtoken;
+            if (token.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos) {
+                fail("INVALID_ARGUMENT",
+                     "this is not an ngrok authtoken: a token holds letters, digits and \"_\" only. Paste the token "
+                     "alone, without a command around it, quotes or spaces",
+                     {{"reason", "characters"}});
+            }
+            // The id of a resource in the ngrok dashboard: a short prefix, "_" and 27 characters.
+            // The dashboard's list of authtokens shows and copies such an id (cr_...), not the token.
+            const auto bar = token.find('_');
+            const bool id_shaped =
+                bar != std::string::npos && bar >= 2 && bar <= 8 && token.size() == bar + 28 &&
+                std::all_of(token.begin(), token.begin() + static_cast<std::ptrdiff_t>(bar), [](char c) { return c >= 'a' && c <= 'z'; }) &&
+                token.find('_', bar + 1) == std::string::npos;
+            if (id_shaped) {
+                const std::string prefix = token.substr(0, bar);
+                if (prefix == "cr") {
+                    fail("INVALID_ARGUMENT",
+                         "this is the id of an ngrok credential (cr_...), not the authtoken itself. The list under "
+                         "Credentials > Authtokens shows and copies ids only: copy the token from Getting Started > "
+                         "Your Authtoken, or add an authtoken and copy what is shown once when it is created",
+                         {{"reason", "credential_id"}});
+                }
+                if (prefix == "ak") {
+                    fail("INVALID_ARGUMENT",
+                         "this is the id of an ngrok API key (ak_...), not an authtoken. Copy the token from Getting "
+                         "Started > Your Authtoken",
+                         {{"reason", "api_key_id"}});
+                }
+                fail("INVALID_ARGUMENT",
+                     "this is the id of an ngrok resource, not an authtoken. Copy the token from Getting Started > "
+                     "Your Authtoken",
+                     {{"reason", "resource_id"}});
+            }
+        }
         const bool has_domain = args.contains("domain");
         const auto domain = has_domain && args.at("domain").is_string() && args.at("domain").get<std::string>().empty()
                                 ? std::optional<std::string>()
@@ -448,7 +488,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         return {{"enabled", text_setting(database_, "remote_enabled").value_or("0") == "1"},
                 {"install_requested", text_setting(database_, "remote_install_requested").value_or("0") == "1"},
                 {"authtoken", text_setting(database_, "remote_authtoken").value_or("")},
-                {"domain", text_setting(database_, "remote_domain").value_or("")}};
+                {"domain", text_setting(database_, "remote_domain").value_or("")},
+                {"default_domain", remote_default_domain()}};
     }
     if (operation == "remote_report") {
         const auto state = require_string(args, "state", 16);
@@ -460,6 +501,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
         // Whether the optional component is there: missing, installing, installed or failed.
         const auto component = optional_string(args, "component", 16);
         const auto component_detail = optional_string(args, "component_detail", 500);
+        // Online at the address ngrok assigned, because the account may not use the name asked for.
+        const bool domain_fallback = optional_bool(args, "domain_fallback", false);
         if (component && *component != "missing" && *component != "installing" && *component != "installed" &&
             *component != "failed") {
             fail("INVALID_ARGUMENT", "component must be missing, installing, installed or failed");
@@ -480,6 +523,8 @@ json ControlService::admin(std::string_view operation, std::string_view target_i
             store_text_setting(database_, "remote_state", state);
             url ? store_text_setting(database_, "remote_url", *url) : erase_setting(database_, "remote_url");
             detail ? store_text_setting(database_, "remote_detail", *detail) : erase_setting(database_, "remote_detail");
+            domain_fallback ? store_text_setting(database_, "remote_domain_fallback", "1")
+                            : erase_setting(database_, "remote_domain_fallback");
             if (changed) {
                 events_.append("remote.changed", {}, "remote_access", {{"state", state}});
             }
@@ -1076,6 +1121,16 @@ json ControlService::settings_view() {
             {"grok_bot_id", text_setting(database_, "grok_bot_id").value_or("")}};
 }
 
+// The name the tunnel asks for when the operator gave none: this installation's own, once made and kept.
+std::string ControlService::remote_default_domain() {
+    if (const auto known = text_setting(database_, "remote_default_domain")) {
+        return *known;
+    }
+    const std::string made = "agora-" + random_hex(3) + ".ngrok.app";
+    store_text_setting(database_, "remote_default_domain", made);
+    return made;
+}
+
 json ControlService::remote_view() {
     const auto optional = [&](std::string_view key) {
         const auto value = text_setting(database_, key);
@@ -1084,11 +1139,47 @@ json ControlService::remote_view() {
     return {{"enabled", text_setting(database_, "remote_enabled").value_or("0") == "1"},
             {"has_authtoken", text_setting(database_, "remote_authtoken").has_value()},
             {"domain", optional("remote_domain")},
+            {"default_domain", remote_default_domain()},
+            {"domain_fallback", text_setting(database_, "remote_domain_fallback").has_value()},
             {"state", text_setting(database_, "remote_state").value_or("stopped")},
             {"public_url", optional("remote_url")},
             {"detail", optional("remote_detail")},
             {"component", text_setting(database_, "remote_component").value_or("missing")},
             {"component_detail", optional("remote_component_detail")}};
+}
+
+json ControlService::operator_status(bool remote) {
+    const std::lock_guard lock(mutex_);
+    return operator_.status(remote);
+}
+
+json ControlService::operator_login(const json& args, bool remote) {
+    const std::lock_guard lock(mutex_);
+    return operator_.login(args, remote);
+}
+
+json ControlService::operator_account(const json& args, std::string_view authority, bool remote) {
+    const std::lock_guard lock(mutex_);
+    return operator_.set(args, authority, remote);
+}
+
+std::optional<std::string> ControlService::operator_check(std::string_view token) {
+    const std::lock_guard lock(mutex_);
+    return operator_.check(token);
+}
+
+void ControlService::operator_logout(std::string_view token, bool all) {
+    const std::lock_guard lock(mutex_);
+    if (all) {
+        operator_.logout_all();
+    } else {
+        operator_.logout(token);
+    }
+}
+
+json ControlService::operator_view() {
+    const std::lock_guard lock(mutex_);
+    return operator_.view();
 }
 
 json ControlService::events_after(std::int64_t after, std::int64_t limit) {

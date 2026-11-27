@@ -444,7 +444,10 @@ The web console supports **English** and **Simplified Chinese** (`Auto` follows 
 
 ### Optional Remote Access (ngrok)
 
-Remote access is disabled and uninstalled by default. To expose the console to external devices, open **Settings > Remote Access (ngrok)**, click **Install** (downloads the official `@ngrok/ngrok` SDK into `<data-dir>\components`), enter your ngrok authtoken, and toggle the switch on. Only the web console and operator API are proxied; `/internal/*` agent endpoints stay strictly loopback-only, and remote authentication locks out after 20 invalid token attempts for 10 minutes.
+Remote access is disabled and uninstalled by default. To expose the console to external devices, open **Settings > Remote Access (ngrok)**, click **Install** (downloads the official `@ngrok/ngrok` SDK into `<data-dir>\components`), enter your ngrok authtoken, and toggle the switch on. Only the web console and operator API are proxied; `/internal/*` agent endpoints stay strictly loopback-only, and remote authentication locks out after 20 failed attempts for 10 minutes.
+
+- **Authtoken**: Copy the token from ngrok's **Getting Started > Your Authtoken** page (or the one-time token shown immediately after creating an authtoken). The **Credentials > Authtokens** table exposes credential IDs (`cr_...`) only; both the console and backend reject credential IDs, API key IDs (`ak_...`), resource IDs, and pasted CLI commands before saving.
+- **Domain**: Leaving the domain field blank requests an installation-specific subdomain (`agora-<6 hex>.ngrok.app`, displayed as the field placeholder). If ngrok declines that name (such as on a free plan or before registering it under **Domains** on a paid plan), AGORA automatically falls back to ngrok's account-assigned address and shows ngrok's reason in **Settings**. Any custom domain you enter explicitly is requested verbatim.
 
 ## MCP Tool Reference
 
@@ -507,7 +510,8 @@ All commands accept `--data-dir`, `--core-port`, and `--mcp-port` for running is
 
 - **Loopback binding**: Both the C++ core (`8766`) and MCP HTTP gateway (`8765`) bind exclusively to `127.0.0.1`.
 - **Credential hashing**: Session credentials are stored in SQLite as SHA-256 digests. Self-enrolled tokens live under `%USERPROFILE%\.acm\identities\`; revoking a session blocks future requests immediately.
-- **Operator token**: Stored in `%USERPROFILE%\.acm\admin-token.txt` and passed via the `X-ACM-Admin-Token` header.
+- **Operator account**: Initial setup prompts for an account name and password the first time you open the console locally on the host machine (blocked over remote tunnels and cross-origin Host-rebinding requests). Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes (600,000 iterations), and sign-in issues a rolling 30-day session token stored only as its SHA-256 digest. **Settings > Account** updates the password (revoking all other active sessions) or signs out all devices. Twenty failed remote attempts within 10 minutes trigger a 10-minute remote lockout while keeping local host sign-in available.
+- **Operator token**: Stored in `%USERPROFILE%\.acm\admin-token.txt` and passed via the `X-ACM-Admin-Token` header for CLI administration, `npm run console` direct launch, and password recovery through the sign-in page's credential-file option.
 - **Artifact containment**: `publish_artifact` canonicalizes paths and verifies symlinks resolve inside the project root; file bytes remain in your project directory.
 - **Metadata-only event stream**: Committed SSE events carry IDs and state transitions without storing message bodies.
 - **Local storage layout**: All persistent state lives in `<data-dir>\acm.db` (SQLite WAL). Runtime logs are written to `<data-dir>\logs\service.log`, `hooks.log`, and `alerts.log`.
@@ -520,13 +524,13 @@ Run the automated test suites:
 ctest --preset windows-dev      # C++23 control core (109 Catch2 tests)
 npm run test:install            # Client installer & hook merging (5 tests)
 npm run test:stdio              # Stdio bridge: auto-start lifecycle, relaying, following service updates, outliving its starter (10 tests)
-npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, models & sender history, pending replies, byte bounds, alerts, wake, remote, tidy (107 tests)
+npm run test:mcp                # End-to-end MCP gateway, hooks, windows, idle dispatch, thread discovery, quota limits, compacting, appearance, models & sender history, pending replies, byte bounds, account sign-in, alerts, wake, remote, tidy (113 tests)
 npm run test:ui                 # Playwright UI visual & interaction checks (requires running `npm run demo -- --fresh`)
 npm run test:codex              # Live Codex CLI integration test (requires authenticated `codex`)
 ```
 
 ```text
-src\core\        C++23 core library: identity, conversations, messages, task board, progress/artifacts,
+src\core\        C++23 core library: identity, operator auth, conversations, messages, task board, progress/artifacts,
                  bot control, wake scheduler, hook delivery, settings, event log, SQLite RAII layer
 src\server\      acm-core Drogon HTTP server (operator API, SSE stream, static console hosting)
 src\mcp\         MCP gateways (server.mjs, stdio.mjs), CLI bridge (cli.mjs), client hooks (hook.mjs),

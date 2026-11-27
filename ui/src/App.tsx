@@ -1,7 +1,7 @@
 // Application shell: operator sign-in, shared console state (snapshot + SSE
 // event stream with cursor resume), primary navigation, theme, and language.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import { ApiError, createApi, followEvents, type Api, type Bootstrap, type EventRecord } from './api';
+import { ApiError, createAccount, createApi, followEvents, loginStatus, signInWithAccount, type Api, type Bootstrap, type EventRecord } from './api';
 import { AgentsView } from './Agents';
 import { EventsView } from './Events';
 import { ManageView } from './Manage';
@@ -12,6 +12,9 @@ import { useI18n, type Messages } from './i18n';
 import { WorkspaceView } from './Workspace';
 
 const TOKEN_KEY = 'acm.operatorToken';
+// A login of the operator's account. Unlike the installation's credential it is kept
+// across browser sessions: it ends by itself, and signing out ends it at the service.
+const LOGIN_KEY = 'acm.operatorLogin';
 const THEME_KEY = 'acm.theme';
 const MAX_EVENTS = 500;
 const TOAST_LIFE = { ok: 3200, danger: 7000 };
@@ -37,6 +40,8 @@ interface ConsoleState {
   run: <T>(action: () => Promise<T>, success?: string) => Promise<T | undefined>;
   /** Opens the service restart confirmation dialog. */
   requestRestart: () => void;
+  /** Goes on with another login of the account (after its password was changed). */
+  adoptLogin: (token: string) => void;
 }
 
 const ConsoleContext = createContext<ConsoleState | null>(null);
@@ -78,7 +83,7 @@ function readInitialToken(): string {
     window.history.replaceState(null, '', window.location.pathname);
     return fragment;
   }
-  return window.sessionStorage.getItem(TOKEN_KEY) ?? '';
+  return window.sessionStorage.getItem(TOKEN_KEY) ?? window.localStorage.getItem(LOGIN_KEY) ?? '';
 }
 
 function useTheme(): [Theme, (theme: Theme) => void] {
@@ -117,29 +122,85 @@ function Brand() {
   );
 }
 
+type SignInMode = 'loading' | 'account' | 'setup' | 'credential';
+
 function SignIn({ onToken, notice }: { onToken: (token: string) => void; notice: string }) {
   const { t, toggleLocale } = useI18n();
+  const [mode, setMode] = useState<SignInMode>('loading');
+  // What the service says about the account: whether there is one, and whether one can be made here.
+  const [status, setStatus] = useState<{ account: boolean; setup_allowed: boolean } | null>(null);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [repeat, setRepeat] = useState('');
   const [value, setValue] = useState('');
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState(notice);
   useEffect(() => {
     setError(notice);
   }, [notice]);
+  useEffect(() => {
+    let cancelled = false;
+    loginStatus()
+      .then((answer) => {
+        if (!cancelled) {
+          setStatus(answer);
+          setMode(answer.account ? 'account' : answer.setup_allowed ? 'setup' : 'credential');
+        }
+      })
+      // An older service, or none: the credential is what is left.
+      .catch(() => !cancelled && setMode('credential'));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const explainFailure = (failure: unknown) =>
+    failure instanceof ApiError && failure.code === 'LOGIN_FAILED'
+      ? t.signIn.wrongAccount
+      : failure instanceof ApiError && failure.code === 'RATE_LIMITED'
+        ? t.signIn.tooManyAttempts
+        : failure instanceof ApiError && failure.status === 401
+          ? t.signIn.invalidToken
+          : failure instanceof ApiError && failure.details.reason === 'password_short'
+            ? t.signIn.passwordShort(Number(failure.details.minimum ?? 8))
+            : t.signIn.connectFailed(explain(failure, t));
+  const adopt = (login: { token: string }) => {
+    window.sessionStorage.removeItem(TOKEN_KEY);
+    window.localStorage.setItem(LOGIN_KEY, login.token);
+    onToken(login.token);
+  };
+  const mismatch = mode === 'setup' && repeat !== '' && repeat !== password;
+  const ready =
+    mode === 'credential'
+      ? value.trim() !== ''
+      : mode === 'account'
+        ? username.trim() !== '' && password !== ''
+        : mode === 'setup' && username.trim() !== '' && password !== '' && repeat === password;
   const submit = async () => {
-    const token = value.trim();
-    if (token === '') {
+    if (!ready) {
       return;
     }
     setChecking(true);
+    setError('');
     try {
-      await createApi(token).bootstrap();
-      window.sessionStorage.setItem(TOKEN_KEY, token);
-      onToken(token);
+      if (mode === 'account') {
+        adopt(await signInWithAccount(username.trim(), password));
+      } else if (mode === 'setup') {
+        adopt(await createAccount(username.trim(), password));
+      } else {
+        const token = value.trim();
+        await createApi(token).bootstrap();
+        window.sessionStorage.setItem(TOKEN_KEY, token);
+        onToken(token);
+      }
     } catch (failure) {
-      setError(failure instanceof ApiError && failure.status === 401 ? t.signIn.invalidToken : t.signIn.connectFailed(explain(failure, t)));
+      setError(explainFailure(failure));
     } finally {
       setChecking(false);
     }
+  };
+  const switchTo = (next: SignInMode) => {
+    setError('');
+    setMode(next);
   };
   return (
     <main className="signin">
@@ -157,32 +218,64 @@ function SignIn({ onToken, notice }: { onToken: (token: string) => void; notice:
             <span>{t.topbar.langShort}</span>
           </button>
         </div>
-        <h1>{t.signIn.title}</h1>
-        <p className="muted">
-          {t.signIn.descBeforeToken}
-          <code>admin-token.txt</code>
-          {t.signIn.descMid}
-          <code>npm run console</code>
-          {t.signIn.descAfterCmd}
-        </p>
-        <label className="field">
-          <span>{t.signIn.tokenLabel}</span>
-          <input type="password" autoFocus autoComplete="off" spellCheck={false} placeholder="acmadmin_…" value={value} onChange={(event) => setValue(event.target.value)} />
-        </label>
+        <h1>{mode === 'setup' ? t.signIn.setupTitle : t.signIn.title}</h1>
+        {mode === 'setup' && <p className="muted">{t.signIn.setupDesc}</p>}
+        {(mode === 'account' || mode === 'setup') && (
+          <>
+            <label className="field">
+              <span>{t.signIn.usernameLabel}</span>
+              <input autoFocus autoComplete="username" spellCheck={false} autoCapitalize="none" value={username} onChange={(event) => setUsername(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>{t.signIn.passwordLabel}</span>
+              <input type="password" autoComplete={mode === 'setup' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} />
+              {mode === 'setup' && <small>{t.signIn.passwordHint}</small>}
+            </label>
+          </>
+        )}
+        {mode === 'setup' && (
+          <label className="field">
+            <span>{t.signIn.repeatLabel}</span>
+            <input type="password" autoComplete="new-password" value={repeat} onChange={(event) => setRepeat(event.target.value)} aria-invalid={mismatch} />
+            {mismatch && <small className="field-problem" role="alert">{t.signIn.repeatMismatch}</small>}
+          </label>
+        )}
+        {mode === 'credential' && (
+          <>
+            <p className="muted">
+              {status !== null && !status.account && !status.setup_allowed && <>{t.signIn.noAccountRemote} </>}
+              {t.signIn.descBeforeToken}
+              <code>admin-token.txt</code>
+              {t.signIn.descMid}
+              <code>npm run console</code>
+              {t.signIn.descAfterCmd}
+            </p>
+            <label className="field">
+              <span>{t.signIn.tokenLabel}</span>
+              <input type="password" autoFocus autoComplete="off" spellCheck={false} placeholder="acmadmin_…" value={value} onChange={(event) => setValue(event.target.value)} />
+            </label>
+          </>
+        )}
         {error !== '' && (
           <p className="form-error" role="alert">
             <Icon name="alert" size={14} /> {error}
           </p>
         )}
-        <button type="submit" className={`btn btn-primary btn-lg ${checking ? 'is-busy' : ''}`} disabled={checking || value.trim() === ''} aria-busy={checking}>
-          {t.signIn.submit}
+        <button type="submit" className={`btn btn-primary btn-lg ${checking ? 'is-busy' : ''}`} disabled={checking || !ready || mode === 'loading'} aria-busy={checking}>
+          {mode === 'setup' ? t.signIn.setupSubmit : t.signIn.submit}
         </button>
+        {/* The other way in, out of the way: the credential file is for the command line and for a forgotten password. */}
+        {mode !== 'loading' && (
+          <button type="button" className="signin-other" onClick={() => switchTo(mode === 'credential' ? (status?.account ? 'account' : 'setup') : 'credential')} hidden={mode === 'credential' && status !== null && !status.account && !status.setup_allowed}>
+            {mode === 'credential' ? (status?.account ? t.signIn.useAccount : t.signIn.useSetup) : t.signIn.useCredential}
+          </button>
+        )}
       </form>
     </main>
   );
 }
 
-function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignOut: (notice: string) => void; theme: Theme; setTheme: (theme: Theme) => void }) {
+function Console({ token, onSignOut, onLogin, theme, setTheme }: { token: string; onSignOut: (notice: string) => void; onLogin: (token: string) => void; theme: Theme; setTheme: (theme: Theme) => void }) {
   const { t, toggleLocale } = useI18n();
   const tRef = useRef(t);
   tRef.current = t;
@@ -329,7 +422,7 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
     data.sessions.filter((session) => session.status === 'requested').length +
     data.proposals.filter((proposal) => proposal.status === 'pending').length +
     data.bot_requests.filter((entry) => entry.status === 'held').length;
-  const state: ConsoleState = { api, data, events, connection, refresh, notify, run, requestRestart: () => setConfirmRestart(true) };
+  const state: ConsoleState = { api, data, events, connection, refresh, notify, run, requestRestart: () => setConfirmRestart(true), adoptLogin: onLogin };
   const avatars = { enabled: data.settings.avatars_enabled, custom: data.avatars ?? {} };
   const tabs: { id: View; label: string; icon: string; badge?: number }[] = [
     { id: 'workspace', label: t.nav.workspace, icon: 'chat' },
@@ -365,7 +458,17 @@ function Console({ token, onSignOut, theme, setTheme }: { token: string; onSignO
               <Icon name={theme === 'dark' ? 'moon' : 'sun'} size={16} />
               <span className="wide-only">{themeLabel}</span>
             </button>
-            <button type="button" className="btn btn-quiet btn-sm" onClick={() => onSignOut('')}>
+            <button
+              type="button"
+              className="btn btn-quiet btn-sm"
+              onClick={() => {
+                // A login is ended at the service too; the installation's credential is only forgotten here.
+                if (token.startsWith('acmlogin_')) {
+                  void api.signOut().catch(() => undefined);
+                }
+                onSignOut('');
+              }}
+            >
               {t.topbar.signOut}
             </button>
           </div>
@@ -466,9 +569,15 @@ export function App() {
   const [notice, setNotice] = useState('');
   const signOut = useCallback((reason: string) => {
     window.sessionStorage.removeItem(TOKEN_KEY);
+    window.localStorage.removeItem(LOGIN_KEY);
     setNotice(reason);
     setToken('');
   }, []);
+  const adoptLogin = useCallback((login: string) => {
+    window.sessionStorage.removeItem(TOKEN_KEY);
+    window.localStorage.setItem(LOGIN_KEY, login);
+    setToken(login);
+  }, []);
   const [theme, setTheme] = useTheme();
-  return token === '' ? <SignIn onToken={setToken} notice={notice} /> : <Console token={token} onSignOut={signOut} theme={theme} setTheme={setTheme} />;
+  return token === '' ? <SignIn onToken={setToken} notice={notice} /> : <Console token={token} onSignOut={signOut} onLogin={adoptLogin} theme={theme} setTheme={setTheme} />;
 }

@@ -159,7 +159,11 @@ await shot('pairing-form-light', 'light', desktop, async (page) => {
 });
 await shot('events-light-1440', 'light', desktop, toEvents);
 await shot('events-dark-1440', 'dark', desktop, toEvents);
-await shot('signin-light', 'light', desktop, async (page) => page.getByRole('button', { name: 'Sign out' }).click());
+await shot('signin-light', 'light', desktop, async (page) => {
+  // No account yet, on this machine: the sign-in page offers to make one.
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('heading', { name: 'Create your account' }).waitFor({ timeout: 3000 });
+});
 
 // ---- language switcher verification (topbar + Settings + Sign-in) ----------
 await shot('flow-language-switch', 'light', desktop, async (page) => {
@@ -178,12 +182,63 @@ await shot('flow-language-switch', 'light', desktop, async (page) => {
   }
   // Verify sign-in page also supports language switching.
   await page.getByRole('button', { name: 'Sign out' }).click();
-  await page.getByRole('heading', { name: 'Operator Console Sign In' }).waitFor({ timeout: 3000 });
+  await page.getByRole('heading', { name: 'Create your account' }).waitFor({ timeout: 3000 });
   await page.getByRole('button', { name: /Switch language/ }).click();
-  await page.getByRole('heading', { name: '登录操作员控制台' }).waitFor({ timeout: 3000 });
+  await page.getByRole('heading', { name: '创建账号' }).waitFor({ timeout: 3000 });
   await page.getByRole('button', { name: /切换界面语言/ }).click();
-  await page.getByRole('heading', { name: 'Operator Console Sign In' }).waitFor({ timeout: 3000 });
+  await page.getByRole('heading', { name: 'Create your account' }).waitFor({ timeout: 3000 });
 });
+
+// ---- signing in with an account -----------------------------------------------
+// For the demo store only (scripts/demo.mjs --fresh): never an account of a real installation.
+const demoAccount = { name: 'operator', password: 'screens-demo-only-pw' };
+await shot('flow-account-setup', 'light', desktop, async (page) => {
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('heading', { name: 'Create your account' }).waitFor({ timeout: 3000 });
+  const create = page.getByRole('button', { name: 'Create and sign in' });
+  await page.getByLabel('Account').fill(demoAccount.name);
+  await page.locator('.signin-card input[type="password"]').first().fill(demoAccount.password);
+  // The second entry has to be the same before anything is sent.
+  await page.locator('.signin-card input[type="password"]').nth(1).fill('something else');
+  await page.getByRole('alert').filter({ hasText: 'do not match' }).waitFor({ timeout: 3000 });
+  if (!(await create.isDisabled())) {
+    throw new Error('two different passwords must not be accepted');
+  }
+  await page.locator('.signin-card input[type="password"]').nth(1).fill(demoAccount.password);
+  await create.click();
+  // Signed in at once, and the settings name the account.
+  await page.waitForSelector('.thread, .blank');
+  await toSettings(page);
+  await page.getByText(`Signed in as ${demoAccount.name}.`).waitFor({ timeout: 3000 });
+});
+await shot('flow-account-signin', 'light', desktop, async (page) => {
+  // The account exists now: the page asks for it, and nothing else.
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('heading', { name: 'Sign in to AGORA' }).waitFor({ timeout: 3000 });
+  if ((await page.getByPlaceholder('acmadmin_…').count()) !== 0) {
+    throw new Error('the credential field should be out of the way');
+  }
+  await page.getByLabel('Account').fill(demoAccount.name);
+  await page.locator('.signin-card input[type="password"]').first().fill('not the password');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('alert').filter({ hasText: 'Incorrect' }).waitFor({ timeout: 5000 });
+  await page.locator('.signin-card input[type="password"]').first().fill(demoAccount.password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.waitForSelector('.thread, .blank');
+  // Still signed in after the page is loaded again, without a credential in the address.
+  await page.reload();
+  await page.waitForSelector('.thread, .blank');
+  // The credential file is one click away for whoever needs it.
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await page.getByRole('button', { name: 'Sign in with credential file' }).click();
+  await page.getByPlaceholder('acmadmin_…').waitFor({ timeout: 3000 });
+  await page.getByRole('button', { name: 'Sign in with account and password' }).click();
+  await page.getByLabel('Account').waitFor({ timeout: 3000 });
+}, 1, /401/);
+await shot('signin-account-zh-dark', 'dark', { width: 420, height: 860 }, async (page) => {
+  await page.getByRole('button', { name: '退出登录' }).or(page.getByRole('button', { name: /退出/ })).first().click();
+  await page.getByRole('heading', { name: '登录 AGORA' }).waitFor({ timeout: 3000 });
+}, 1, undefined, 'zh-CN');
 
 // ---- live interactive flows ------------------------------------------------
 await shot('pairing-guide-light', 'light', desktop, async (page) => {
@@ -357,6 +412,28 @@ await shot('settings-remote-light', 'light', desktop, async (page) => {
   await toSettings(page);
   await page.getByRole('button', { name: 'ngrok settings' }).click();
   await page.getByPlaceholder(/Your Authtoken/).waitFor({ timeout: 3000 });
+});
+await shot('flow-remote-token-check', 'light', desktop, async (page) => {
+  // The id that the ngrok dashboard's list of authtokens copies is told apart from a token as it is typed.
+  await toSettings(page);
+  await page.getByRole('button', { name: 'ngrok settings' }).click();
+  const field = page.getByPlaceholder(/Your Authtoken/);
+  await field.fill('cr_A1b2C3d4E5f6G7h8I9j0K1l2M3n');
+  await page.getByRole('alert').filter({ hasText: 'credential ID' }).waitFor({ timeout: 3000 });
+  const save = page.locator('.hook-form').filter({ has: field }).getByRole('button', { name: 'Save' });
+  if (!(await save.isDisabled())) {
+    throw new Error('an id must not be saved as a token');
+  }
+  await field.fill('ngrok config add-authtoken abc');
+  await page.getByRole('alert').filter({ hasText: 'letters, digits' }).waitFor({ timeout: 3000 });
+  // A token: nothing to complain about, and it can be saved.
+  await field.fill('A1b2C3d4E5f6G7h8I9j0K1l2M3n_4o5P6q7R8s9T0u1V2w3X4');
+  await page.getByText(/hidden after save/).waitFor({ timeout: 3000 });
+  if (await save.isDisabled()) {
+    throw new Error('a token must be accepted');
+  }
+  await field.fill('cr_A1b2C3d4E5f6G7h8I9j0K1l2M3n');
+  await page.getByRole('alert').waitFor({ timeout: 3000 });
 });
 await shot('settings-narrow-dark', 'dark', { width: 420, height: 860 }, async (page) => {
   await toSettings(page);

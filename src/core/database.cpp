@@ -558,6 +558,22 @@ constexpr const char* kMigrations[] = {
     R"sql(
     ALTER TABLE windows ADD COLUMN reminded_at TEXT;
     )sql",
+    // 033 - signing in to the console with an account: the logins it issued (their digests
+    // only) and the failed attempts that slow guessing down. The account itself is two settings.
+    R"sql(
+    CREATE TABLE operator_logins (
+        token_hash TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        used_at    TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        remote     INTEGER NOT NULL DEFAULT 0
+    ) WITHOUT ROWID;
+    CREATE TABLE operator_login_failures (
+        at     TEXT NOT NULL,
+        remote INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX operator_login_failures_at ON operator_login_failures (remote, at);
+    )sql",
 };
 
 }  // namespace

@@ -10,7 +10,7 @@
 // Run: node --test test/mcp/remote.spec.mjs
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,8 @@ import { after, before, describe, it } from 'node:test';
 import { freePort, repoRoot, startService } from '../support/service.mjs';
 
 process.env.ACM_TUNNEL_STUB = '1';
+// The stand-in tunnel refuses these names, as ngrok refuses a chosen name to a free account.
+process.env.ACM_TUNNEL_STUB_REFUSE = '\\.ngrok\\.app$';
 process.env.ACM_REMOTE_INTERVAL_MS = '200';
 
 const runId = randomBytes(4).toString('hex');
@@ -67,11 +69,32 @@ describe('remote access to the console', { concurrency: false }, () => {
 
   it('is off until the operator enters a tunnel credential and switches it on', async () => {
     // A new installation has no tunnel component and nothing switched on.
-    assert.deepEqual(await remote(), { component: 'missing', component_detail: null, detail: null, domain: null, enabled: false, has_authtoken: false, public_url: null, state: 'stopped' });
+    const fresh = await remote();
+    // With no domain given the tunnel will ask for a name of this installation's own.
+    assert.match(fresh.default_domain, /^agora-[0-9a-f]{6}\.ngrok\.app$/);
+    assert.deepEqual(fresh, { component: 'missing', component_detail: null, default_domain: fresh.default_domain, detail: null, domain: null, domain_fallback: false, enabled: false, has_authtoken: false, public_url: null, state: 'stopped' });
     await assert.rejects(service.admin('PUT', '/api/v1/remote-access', { enabled: true }), { code: 'INVALID_ARGUMENT' });
     await assert.rejects(service.admin('PUT', '/api/v1/remote-access', { domain: 'https://bad/path' }), { code: 'INVALID_ARGUMENT' });
 
     // Storing the credential alone opens nothing, and it cannot be switched on without the component.
+    // What cannot be a token is refused when it is saved, with the reason: the dashboard's
+    // list of authtokens shows and copies the id of a credential, not the token.
+    const id = 'A1b2C3d4E5f6G7h8I9j0K1l2M3n';
+    for (const [pasted, reason] of [
+      [`cr_${id}`, 'credential_id'],
+      [`ak_${id}`, 'api_key_id'],
+      [`rd_${id}`, 'resource_id'],
+      [`ngrok config add-authtoken ${id}_${id.slice(0, 21)}`, 'characters'],
+      [`"${id}_${id.slice(0, 21)}"`, 'characters'],
+    ]) {
+      const refusal = await service.admin('PUT', '/api/v1/remote-access', { authtoken: pasted }).then(() => null, (error) => error);
+      assert.equal(refusal?.code, 'INVALID_ARGUMENT', pasted.slice(0, 12));
+      assert.equal(refusal.details.reason, reason);
+    }
+    assert.match((await service.admin('PUT', '/api/v1/remote-access', { authtoken: `cr_${id}` }).catch((error) => error)).message, /Your Authtoken/);
+    assert.equal((await remote()).has_authtoken, false);
+    // A token as ngrok issues them, and the shapes it used before, are taken as they are.
+    assert.equal((await service.admin('PUT', '/api/v1/remote-access', { authtoken: `${id}_${id.slice(0, 21)}` })).has_authtoken, true);
     const stored = await service.admin('PUT', '/api/v1/remote-access', { authtoken: AUTHTOKEN });
     assert.deepEqual([stored.enabled, stored.has_authtoken, stored.state], [false, true, 'stopped']);
     await assert.rejects(service.admin('PUT', '/api/v1/remote-access', { enabled: true }), { code: 'INVALID_ARGUMENT', message: /not installed/ });
@@ -90,6 +113,23 @@ describe('remote access to the console', { concurrency: false }, () => {
     publicUrl = (await remote()).public_url;
     assert.match(publicUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
     assert.notEqual(publicUrl, service.coreUrl);
+    // It asked for its AGORA name first; this account may not have one, so it is online at
+    // the address it was assigned, and the console can say why.
+    const asked = readFileSync(join(base, 'data', 'components', 'stub-domains.log'), 'utf8').split('\n').slice(0, -1);
+    assert.deepEqual(asked, [fresh.default_domain, '']);
+    const online = await remote();
+    assert.equal(online.domain_fallback, true);
+    assert.match(online.detail, /may not bind agora-/);
+    assert.equal(online.default_domain, fresh.default_domain);
+    // A name the operator chose is asked for as it is, and not replaced when it is refused.
+    await service.admin('PUT', '/api/v1/remote-access', { domain: 'chosen.ngrok.app' });
+    await waitFor(async () => (await remote()).state === 'error', 5000, 'the chosen name to be refused');
+    assert.match((await remote()).detail, /may not bind chosen\.ngrok\.app/);
+    assert.equal((await remote()).domain_fallback, false);
+    await service.admin('PUT', '/api/v1/remote-access', { domain: 'agora.example.test' });
+    await waitFor(async () => (await remote()).state === 'online', 5000, 'the tunnel to open under the chosen name');
+    assert.deepEqual([(await remote()).domain, (await remote()).domain_fallback, (await remote()).detail], ['agora.example.test', false, null]);
+    publicUrl = (await remote()).public_url;
     // The credential is in nothing the console or the event log shows.
     assert.ok(!JSON.stringify(await service.admin('GET', '/api/v1/bootstrap')).includes(AUTHTOKEN));
     assert.ok(!JSON.stringify(await service.admin('GET', '/api/v1/events?after=0&limit=1000')).includes(AUTHTOKEN));

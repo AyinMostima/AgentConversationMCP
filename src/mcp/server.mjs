@@ -8,7 +8,7 @@
 //
 //   node src/mcp/server.mjs [--data-dir DIR] [--mcp-port 8765] [--core-port 8766] [--core-exe PATH] [--ui-dir DIR]
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,12 +230,21 @@ const http = createServer((request, response) => {
     response.writeHead(204, restartCors);
     response.end();
   } else if (path === '/restart' && request.method === 'POST') {
-    if (request.headers['x-acm-admin-token'] !== adminToken()) {
-      sendJson(response, 401, { ok: false, error: { code: 'ADMIN_REQUIRED', message: 'operator credential required' } }, restartCors);
-      return;
-    }
-    sendJson(response, 200, { ok: true, result: { restarting: true } }, restartCors);
-    restart().catch(fail);
+    // The installation's credential, or a login of the operator's account (the control service knows those).
+    const presented = request.headers['x-acm-admin-token'];
+    const known = presented === adminToken()
+      ? Promise.resolve(true)
+      : typeof presented === 'string' && presented.startsWith('acmlogin_')
+        ? fetch(`${coreUrl}/api/v1/session`, { headers: { 'x-acm-admin-token': presented } }).then((answer) => answer.ok, () => false)
+        : Promise.resolve(false);
+    void known.then((yes) => {
+      if (!yes) {
+        sendJson(response, 401, { ok: false, error: { code: 'ADMIN_REQUIRED', message: 'sign in first' } }, restartCors);
+        return;
+      }
+      sendJson(response, 200, { ok: true, result: { restarting: true } }, restartCors);
+      restart().catch(fail);
+    });
   } else if (path === '/shutdown' && request.method === 'POST') {
     if (request.headers['x-acm-admin-token'] !== adminToken()) {
       sendJson(response, 401, { ok: false, error: { code: 'ADMIN_REQUIRED', message: 'operator credential required' } });
@@ -372,7 +381,16 @@ try {
       mkdirSync(join(options.dataDir, 'components'), { recursive: true });
       writeFileSync(stubMarker, 'stub\n');
     },
-    openTunnel: async ({ port }) => ({ url: `http://${HOST}:${port}`, close: async () => undefined }),
+    // ACM_TUNNEL_STUB_REFUSE: a pattern of domains this stand-in refuses, as ngrok refuses a
+    // name to an account that may not choose one. Every domain asked for is written down.
+    openTunnel: async ({ port, domain }) => {
+      appendFileSync(join(options.dataDir, 'components', 'stub-domains.log'), `${domain}\n`);
+      const refuse = process.env.ACM_TUNNEL_STUB_REFUSE;
+      if (refuse !== undefined && refuse !== '' && domain !== '' && new RegExp(refuse).test(domain)) {
+        throw new Error(`ERR_NGROK_STUB this account may not bind ${domain}`);
+      }
+      return { url: `http://${HOST}:${port}`, close: async () => undefined };
+    },
   };
   stopRemote = startRemoteAccess({
     coreUrl,
